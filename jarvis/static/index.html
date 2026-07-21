@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>J.A.R.V.I.S. HUD</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="hud-container">
+        <!-- Top HUD Elements -->
+        <div class="hud-top">
+            <div class="hud-corner top-left">SYS.V_2.0</div>
+            <div class="hud-center-title">J.A.R.V.I.S.</div>
+            <div class="hud-corner top-right">ONLINE</div>
+        </div>
+
+        <!-- Central Arc Reactor / Visualizer -->
+        <div class="arc-reactor-container">
+            <div class="arc-reactor" id="arc-visualizer">
+                <div class="core"></div>
+                <div class="ring outer-ring"></div>
+                <div class="ring inner-ring"></div>
+            </div>
+        </div>
+
+        <!-- Chat Log -->
+        <div class="chat-container" id="chat-container">
+            <div class="message system-msg">System initialized. J.A.R.V.I.S. is online. How may I assist you, sir?</div>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-container">
+            <button id="mic-btn" class="hud-btn mic-btn">
+                <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                    <line x1="12" y1="19" x2="12" y2="23"></line>
+                    <line x1="8" y1="23" x2="16" y2="23"></line>
+                </svg>
+            </button>
+            <input type="text" id="chat-input" placeholder="Enter command or speak..." autocomplete="off">
+            <button id="send-btn" class="hud-btn send-btn">
+                <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+            </button>
+        </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "jarvis"
+version = "1.0.0"
+description = "J.A.R.V.I.S. — Just A Rather Very Intelligent System. Personal AI assistant powered by NVIDIA."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]

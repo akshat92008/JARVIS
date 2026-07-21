@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+J.A.R.V.I.S. — Interactive CLI
+
+Usage:
+    jarvis                          Start interactive mode
+    jarvis --model kimi             Start with a specific model
+    jarvis "build a flask app"      Run a single prompt and exit
+    jarvis --voice                  Start in voice mode
+    jarvis --telegram               Start the Telegram bot
+    jarvis --list-models            Show all available models
+"""
+
+import argparse
+import os
+import sys
+
+from jarvis.agent import JarvisAgent
+from jarvis.models import resolve_model, DEFAULT_MODEL, list_models, ALIASES
+from jarvis import ui
+from jarvis.memory import ConversationMemory
+from jarvis.voice.engine import VoiceEngine
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="jarvis",
+        description="J.A.R.V.I.S. — Just A Rather Very Intelligent System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  jarvis                              Interactive mode (default model)
+  jarvis --model kimi-k3              Use Kimi K3
+  jarvis --voice                      Start in voice mode
+  jarvis "create a REST API"          Single prompt mode
+  jarvis --list-models                List all available models
+  jarvis --telegram                   Start Telegram bot
+
+Environment:
+  NVIDIA_API_KEY                      Your NVIDIA API key (from build.nvidia.com)
+  TELEGRAM_BOT_TOKEN                  Telegram bot token (from @BotFather)
+  TELEGRAM_USER_ID                    Your Telegram user ID (for security)
+        """,
+    )
+    parser.add_argument("prompt", nargs="?", help="Single prompt to run")
+    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Model to use (default: {DEFAULT_MODEL})")
+    parser.add_argument("--api-key", "-k", help="NVIDIA API key")
+    parser.add_argument("--working-dir", "-d", help="Working directory")
+    parser.add_argument("--voice", "-v", action="store_true", help="Enable voice mode")
+    parser.add_argument("--telegram", "-t", action="store_true", help="Start Telegram bot")
+    parser.add_argument("--list-models", action="store_true", help="List available models")
+    return parser.parse_args()
+
+
+def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine) -> bool:
+    """Handle slash commands. Returns True if handled."""
+    parts = cmd.strip().split(maxsplit=1)
+    command = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if command in ("/exit", "/quit", "/q"):
+        ui.print_goodbye()
+        sys.exit(0)
+
+    elif command == "/help":
+        ui.print_help()
+        return True
+
+    elif command == "/voice":
+        new_state = voice_engine.toggle()
+        agent.voice_mode = new_state
+        if new_state:
+            ui.print_success("Voice mode enabled. I'm listening, sir.")
+            voice_engine.speak("Voice mode activated. I'm listening, sir.")
+        else:
+            ui.print_info("Voice mode disabled. Text input only.")
+        return True
+
+    elif command == "/models":
+        models = list_models()
+        ui.print_models(models, agent.model_key)
+        return True
+
+    elif command == "/model":
+        if not arg:
+            ui.print_info(f"Current model: {agent.model_cfg['name']} ({agent.model_key})")
+            return True
+        if agent.set_model(arg):
+            ui.print_success(f"Switched to {agent.model_cfg['name']}")
+        else:
+            ui.print_error(f"Unknown model: {arg}. Use /models to see options.")
+        return True
+
+    elif command == "/clear":
+        agent.clear_history()
+        ui.print_success("Conversation cleared. Fresh start, sir.")
+        return True
+
+    elif command == "/compact":
+        removed = agent.compact_conversation()
+        ui.print_success(f"Compacted conversation. Removed {removed} messages.")
+        return True
+
+    elif command == "/memory":
+        summary = agent.user_mem.get_summary()
+        ui.console.print(summary)
+        return True
+
+    elif command == "/remember":
+        if arg:
+            agent.user_mem.add_fact(arg)
+            ui.print_success(f"Noted and remembered: \"{arg}\"")
+        else:
+            ui.print_info("Usage: /remember <fact about you>")
+        return True
+
+    elif command == "/forget":
+        agent.user_mem.reset()
+        ui.print_success("Personal memory cleared.")
+        return True
+
+    elif command == "/history":
+        mem = ConversationMemory()
+        convs = mem.list_conversations(limit=10)
+        if not convs:
+            ui.print_info("No conversation history yet.")
+        else:
+            for c in convs:
+                ui.console.print(f"  [{ui.DIM}]{c['created_at'][:19]}[/] [{ui.WHITE}]{c['preview']}[/]")
+        return True
+
+    elif command == "/save":
+        path = arg or f"~/Desktop/jarvis_conversation_{agent.conversation_id}.json"
+        agent.save_conversation(path)
+        return True
+
+    elif command == "/undo":
+        from jarvis.history import get_history
+        success, msg = get_history().undo_last_change()
+        if success:
+            ui.print_success(msg)
+        else:
+            ui.print_error(msg)
+        return True
+
+    elif command == "/changes":
+        from jarvis.history import get_history
+        summary = get_history().get_change_summary()
+        ui.console.print(summary)
+        return True
+
+    elif command == "/status":
+        from jarvis.tools.desktop import tool_get_system_info
+        info = tool_get_system_info()
+        ui.console.print(info)
+        return True
+
+    elif command == "/telegram":
+        ui.print_info("Starting Telegram bot...")
+        try:
+            from jarvis.telegram.bot import start_telegram_bot
+            start_telegram_bot(agent)
+        except ImportError:
+            ui.print_error("Telegram bot dependencies not installed. Run: pip install python-telegram-bot")
+        except Exception as e:
+            ui.print_error(f"Telegram error: {e}")
+        return True
+
+    elif command == "/desktop":
+        ui.console.print(f"\n  [{ui.GOLD}]Desktop Commands:[/]")
+        ui.console.print(f"    [{ui.WHITE}]Just ask naturally:[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"Open Safari\"[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"Set volume to 50\"[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"Take a screenshot\"[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"What apps are running?\"[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"Lock my screen\"[/]")
+        ui.console.print(f"    [{ui.DIM}]• \"Show system status\"[/]")
+        ui.console.print()
+        return True
+
+    elif command == "/agents":
+        from jarvis.tools.agent_factory import tool_list_agents
+        result = tool_list_agents()
+        ui.console.print(result)
+        return True
+
+    elif command == "/spawn":
+        if not arg:
+            ui.print_info("Usage: /spawn <task description>")
+            ui.print_info("Creates a quick agent and runs it on the task.")
+            return True
+        # Quick-spawn: create a temporary agent and run it
+        response = agent.run(f"Create a temporary AI agent to handle this task, then run it: {arg}")
+        return True
+
+    elif command == "/tools":
+        from jarvis.tools.registry import get_tool_count
+        counts = get_tool_count()
+        ui.console.print(f"\n  [{ui.GOLD}]⚡ J.A.R.V.I.S. Tool Arsenal[/]")
+        ui.console.print(f"    [{ui.CYAN}]Core Coding:[/]      [{ui.WHITE}]{counts.get('coding', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Advanced Coding:[/]  [{ui.WHITE}]{counts.get('advanced_coding', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Agent Factory:[/]    [{ui.WHITE}]{counts.get('agent_factory', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Desktop Control:[/]  [{ui.WHITE}]{counts.get('desktop', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Research:[/]         [{ui.WHITE}]{counts.get('research', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Documents:[/]        [{ui.WHITE}]{counts.get('documents', 0)} tools[/]")
+        ui.console.print(f"    [{ui.CYAN}]Communication:[/]    [{ui.WHITE}]{counts.get('communication', 0)} tools[/]")
+        ui.console.print(f"    [{ui.GOLD}]{'─' * 30}[/]")
+        ui.console.print(f"    [{ui.GOLD}]Total:[/]            [{ui.WHITE}]{counts.get('total', 0)} tools[/]")
+        ui.console.print()
+        return True
+
+    elif command == "/project":
+        if not arg:
+            ui.print_info("Usage: /project <template> <name>")
+            ui.print_info("Templates: python-cli, python-api, flask, react, nextjs, vue, express, go, rust, django, fullstack")
+            return True
+        response = agent.run(f"Generate a project using the generate_project tool: {arg}")
+        return True
+
+    return False
+
+
+def run_interactive(agent: JarvisAgent, voice_engine: VoiceEngine):
+    """Run the interactive CLI loop."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.styles import Style
+
+    history_file = os.path.expanduser("~/.jarvis/cli_history")
+    os.makedirs(os.path.dirname(history_file), exist_ok=True)
+
+    prompt_style = Style.from_dict({
+        "prompt": "#00d4ff bold",
+    })
+
+    session = PromptSession(
+        history=FileHistory(history_file),
+        style=prompt_style,
+    )
+
+    while True:
+        try:
+            # Voice input mode
+            if voice_engine.enabled:
+                ui.print_voice_listening()
+                text = voice_engine.listen_once(timeout=15)
+                if text:
+                    ui.print_voice_transcription(text)
+                    user_input = text
+                else:
+                    ui.print_info("Didn't catch that. Try again, or type your request.")
+                    continue
+            else:
+                # Text input mode
+                user_input = session.prompt(
+                    [("class:prompt", "◈ JARVIS › ")],
+                ).strip()
+
+            if not user_input:
+                continue
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                if handle_slash_command(user_input, agent, voice_engine):
+                    continue
+
+            # Run the agent
+            response = agent.run(user_input)
+
+            # Voice output
+            if voice_engine.enabled and response:
+                voice_engine.speak(response)
+
+        except KeyboardInterrupt:
+            ui.console.print()
+            ui.print_goodbye()
+            break
+        except EOFError:
+            ui.print_goodbye()
+            break
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    # List models
+    if args.list_models:
+        models = list_models()
+        ui.print_models(models)
+        return
+
+    # Resolve model
+    model_key = args.model
+    model_cfg = resolve_model(model_key)
+    if not model_cfg:
+        ui.print_error(f"Unknown model: {model_key}")
+        ui.print_info("Use --list-models to see available models.")
+        sys.exit(1)
+
+    # Set working directory
+    working_dir = args.working_dir or os.getcwd()
+
+    # Create agent
+    try:
+        agent = JarvisAgent(
+            api_key=args.api_key,
+            model_key=model_key,
+            working_dir=working_dir,
+        )
+    except ValueError as e:
+        ui.print_error(str(e))
+        sys.exit(1)
+
+    # Voice engine
+    voice_engine = VoiceEngine()
+    if args.voice:
+        if voice_engine.available:
+            voice_engine.enable()
+            agent.voice_mode = True
+        else:
+            ui.print_warning("Voice dependencies not available. Install: pip install SpeechRecognition PyAudio")
+
+    # Telegram mode
+    if args.telegram:
+        ui.print_boot_sequence(model_cfg["name"], working_dir)
+        ui.print_info("Starting Telegram bot mode...")
+        try:
+            from jarvis.telegram.bot import start_telegram_bot
+            start_telegram_bot(agent)
+        except ImportError:
+            ui.print_error("Install python-telegram-bot: pip install python-telegram-bot")
+        except Exception as e:
+            ui.print_error(f"Telegram error: {e}")
+        return
+
+    # Single prompt mode
+    if args.prompt:
+        response = agent.run(args.prompt)
+        return
+
+    # Interactive mode
+    ui.print_boot_sequence(model_cfg["name"], working_dir)
+
+    if voice_engine.enabled:
+        ui.print_success("Voice mode active. Speak your commands.")
+        voice_engine.greet()
+
+    run_interactive(agent, voice_engine)
+
+
+if __name__ == "__main__":
+    main()
