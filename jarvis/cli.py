@@ -16,7 +16,7 @@ import os
 import sys
 
 from jarvis.agent import JarvisAgent
-from jarvis.models import resolve_model, DEFAULT_MODEL, list_models, ALIASES
+from jarvis.models import resolve_model, DEFAULT_MODEL, list_models
 from jarvis import ui
 from jarvis.memory import ConversationMemory
 from jarvis.voice.engine import VoiceEngine
@@ -47,7 +47,10 @@ Environment:
     parser.add_argument("--api-key", "-k", help="NVIDIA API key")
     parser.add_argument("--working-dir", "-d", help="Working directory")
     parser.add_argument("--voice", "-v", action="store_true", help="Enable voice mode")
+    parser.add_argument("--web", "-w", action="store_true", help="Launch JARVIS Web Interface (HUD)")
+    parser.add_argument("--no-web", action="store_true", help="Disable automatic launch of JARVIS Web Interface")
     parser.add_argument("--telegram", "-t", action="store_true", help="Start Telegram bot")
+    parser.add_argument("--fable", "-f", action="store_true", help="Execute Claude Fable 5 Mythos CoT reasoning planning engine")
     parser.add_argument("--list-models", action="store_true", help="List available models")
     return parser.parse_args()
 
@@ -64,6 +67,13 @@ def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine
 
     elif command == "/help":
         ui.print_help()
+        return True
+
+    elif command == "/fable":
+        if not arg:
+            ui.print_info("Usage: /fable <task request>")
+            return True
+        agent.run_fable_reasoning(arg)
         return True
 
     elif command == "/voice":
@@ -155,6 +165,19 @@ def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine
         ui.console.print(info)
         return True
 
+    elif command in ("/company", "/briefing", "/approvals"):
+        import json
+        from jarvis.tools.amaura import get_control_plane
+        control = get_control_plane()
+        if command == "/company":
+            result = control.dashboard()
+        elif command == "/briefing":
+            result = control.daily_briefing()
+        else:
+            result = {"pending_approvals": control.store.list_approvals("pending")}
+        ui.console.print_json(json.dumps(result, default=str))
+        return True
+
     elif command == "/telegram":
         ui.print_info("Starting Telegram bot...")
         try:
@@ -190,7 +213,7 @@ def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine
             ui.print_info("Creates a quick agent and runs it on the task.")
             return True
         # Quick-spawn: create a temporary agent and run it
-        response = agent.run(f"Create a temporary AI agent to handle this task, then run it: {arg}")
+        agent.run(f"Create a temporary AI agent to handle this task, then run it: {arg}")
         return True
 
     elif command == "/tools":
@@ -214,30 +237,93 @@ def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine
             ui.print_info("Usage: /project <template> <name>")
             ui.print_info("Templates: python-cli, python-api, flask, react, nextjs, vue, express, go, rust, django, fullstack")
             return True
-        response = agent.run(f"Generate a project using the generate_project tool: {arg}")
+        agent.run(f"Generate a project using the generate_project tool: {arg}")
         return True
 
     return False
 
 
+def handle_natural_or_slash_command(user_input: str, agent: JarvisAgent, voice_engine: VoiceEngine) -> bool:
+    """
+    Normalizes natural language queries and slash commands so the user never has to type slash commands.
+    Returns True if handled locally, False if it should be passed to the LLM agent.
+    """
+    clean = user_input.strip().lower()
+    
+    # Direct slash commands
+    if user_input.startswith("/"):
+        return handle_slash_command(user_input, agent, voice_engine)
+    
+    # Natural language shortcuts mapping to commands
+    natural_mappings = {
+        "tools": "/tools",
+        "show tools": "/tools",
+        "list tools": "/tools",
+        "what tools do you have": "/tools",
+        "what tools do you have?": "/tools",
+        "tool list": "/tools",
+        "my tools": "/tools",
+        "help": "/help",
+        "commands": "/help",
+        "show commands": "/help",
+        "how to use": "/help",
+        "what can you do": "/help",
+        "what can you do?": "/help",
+        "undo": "/undo",
+        "undo change": "/undo",
+        "undo changes": "/undo",
+        "undo last change": "/undo",
+        "undo last edit": "/undo",
+        "revert": "/undo",
+        "clear": "/clear",
+        "reset": "/clear",
+        "clear conversation": "/clear",
+        "clear history": "/clear",
+        "status": "/status",
+        "system status": "/status",
+        "system info": "/status",
+        "show status": "/status",
+        "models": "/models",
+        "list models": "/models",
+        "show models": "/models",
+        "history": "/history",
+        "show history": "/history",
+        "memory": "/memory",
+        "show memory": "/memory",
+        "changes": "/changes",
+        "show changes": "/changes",
+        "exit": "/exit",
+        "quit": "/exit",
+        "bye": "/exit",
+        "voice": "/voice",
+        "toggle voice": "/voice",
+        "desktop": "/desktop",
+        "desktop commands": "/desktop",
+        "agents": "/agents",
+        "list agents": "/agents",
+        "show agents": "/agents",
+    }
+    
+    if clean in natural_mappings:
+        return handle_slash_command(natural_mappings[clean], agent, voice_engine)
+    
+    # Handle natural "switch to model <X>" or "use model <X>"
+    if clean.startswith("switch model to ") or clean.startswith("use model "):
+        model_arg = clean.replace("switch model to ", "").replace("use model ", "").strip()
+        return handle_slash_command(f"/model {model_arg}", agent, voice_engine)
+    
+    # Handle natural "remember that <X>" or "remember <X>"
+    if clean.startswith("remember that ") or clean.startswith("remember "):
+        fact_arg = user_input.strip()[len("remember "):].strip()
+        if fact_arg.lower().startswith("that "):
+            fact_arg = fact_arg[5:].strip()
+        return handle_slash_command(f"/remember {fact_arg}", agent, voice_engine)
+        
+    return False
+
+
 def run_interactive(agent: JarvisAgent, voice_engine: VoiceEngine):
     """Run the interactive CLI loop."""
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.history import FileHistory
-    from prompt_toolkit.styles import Style
-
-    history_file = os.path.expanduser("~/.jarvis/cli_history")
-    os.makedirs(os.path.dirname(history_file), exist_ok=True)
-
-    prompt_style = Style.from_dict({
-        "prompt": "#00d4ff bold",
-    })
-
-    session = PromptSession(
-        history=FileHistory(history_file),
-        style=prompt_style,
-    )
-
     while True:
         try:
             # Voice input mode
@@ -252,17 +338,19 @@ def run_interactive(agent: JarvisAgent, voice_engine: VoiceEngine):
                     continue
             else:
                 # Text input mode
-                user_input = session.prompt(
-                    [("class:prompt", "◈ JARVIS › ")],
-                ).strip()
+                try:
+                    user_input = input("\033[1;36m◈ JARVIS › \033[0m").strip()
+                except (EOFError, KeyboardInterrupt):
+                    ui.console.print()
+                    ui.print_goodbye()
+                    break
 
             if not user_input:
                 continue
 
-            # Handle slash commands
-            if user_input.startswith("/"):
-                if handle_slash_command(user_input, agent, voice_engine):
-                    continue
+            # Check natural language shortcuts & slash commands
+            if handle_natural_or_slash_command(user_input, agent, voice_engine):
+                continue
 
             # Run the agent
             response = agent.run(user_input)
@@ -278,6 +366,43 @@ def run_interactive(agent: JarvisAgent, voice_engine: VoiceEngine):
         except EOFError:
             ui.print_goodbye()
             break
+
+
+def launch_background_web(open_browser_flag: bool = True) -> str:
+    """Launch JARVIS Web Interface server asynchronously without blocking CLI startup."""
+    import threading
+
+    port = int(os.environ.get("JARVIS_PORT", "8000"))
+    host = os.environ.get("JARVIS_HOST", "127.0.0.1")
+    url = f"http://localhost:{port}"
+
+    def _async_launcher():
+        import socket
+        import time
+        import webbrowser
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            is_running = (sock.connect_ex((host, port)) == 0)
+            sock.close()
+        except Exception:
+            is_running = False
+
+        if not is_running:
+            try:
+                import uvicorn
+                uvicorn.run(
+                    "jarvis.server:app",
+                    host="0.0.0.0",
+                    port=port,
+                    log_level="warning",
+                )
+            except Exception:
+                pass
+
+    threading.Thread(target=_async_launcher, daemon=True).start()
+    return url
 
 
 def main():
@@ -301,6 +426,9 @@ def main():
     # Set working directory
     working_dir = args.working_dir or os.getcwd()
 
+    # Print boot banner IMMEDIATELY for instant terminal feedback
+    ui.print_boot_sequence(model_cfg["name"], working_dir)
+
     # Create agent
     try:
         agent = JarvisAgent(
@@ -321,9 +449,17 @@ def main():
         else:
             ui.print_warning("Voice dependencies not available. Install: pip install SpeechRecognition PyAudio")
 
+    # Web Mode explicitly requested
+    if args.web:
+        ui.print_info("Launching JARVIS Web Interface...")
+        url = launch_background_web(open_browser_flag=True)
+        ui.print_success(f"JARVIS Web Interface running at {url}")
+        from jarvis.server import main as start_server
+        start_server()
+        return
+
     # Telegram mode
     if args.telegram:
-        ui.print_boot_sequence(model_cfg["name"], working_dir)
         ui.print_info("Starting Telegram bot mode...")
         try:
             from jarvis.telegram.bot import start_telegram_bot
@@ -334,13 +470,21 @@ def main():
             ui.print_error(f"Telegram error: {e}")
         return
 
-    # Single prompt mode
-    if args.prompt:
-        response = agent.run(args.prompt)
+    # Single prompt mode with Fable-5 Reasoning
+    if args.fable:
+        prompt = args.prompt or "scaffold complete production ready python web application with tests"
+        agent.run_fable_reasoning(prompt)
         return
 
-    # Interactive mode
-    ui.print_boot_sequence(model_cfg["name"], working_dir)
+    # Single prompt mode
+    if args.prompt:
+        agent.run(args.prompt)
+        return
+
+    # Interactive mode — automatically launches Web HUD alongside CLI
+    if not args.no_web:
+        web_url = launch_background_web(open_browser_flag=True)
+        ui.print_success(f"JARVIS Web Interface HUD live at {web_url}")
 
     if voice_engine.enabled:
         ui.print_success("Voice mode active. Speak your commands.")

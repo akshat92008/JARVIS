@@ -5,7 +5,6 @@ Supports text messages, voice notes, and file sharing.
 
 import os
 import asyncio
-import logging
 import tempfile
 from pathlib import Path
 
@@ -28,8 +27,8 @@ def start_telegram_bot(agent):
     allowed_user_id = os.environ.get("TELEGRAM_USER_ID", "")
 
     try:
-        from telegram import Update
-        from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+        from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
     except ImportError:
         ui.print_error("Install python-telegram-bot: pip install python-telegram-bot")
         return
@@ -48,6 +47,7 @@ def start_telegram_bot(agent):
             "• 💬 Text messages for any request\n"
             "• 🎤 Voice notes (I'll transcribe and process)\n"
             "• 📎 Files (I'll save them to your Mac)\n\n"
+            "Company controls: /briefing, /approvals, /resume\n\n"
             "At your service, sir.",
             parse_mode="Markdown",
         )
@@ -137,12 +137,109 @@ def start_telegram_bot(agent):
         info = tool_get_system_info()
         await update.message.reply_text(f"```\n{info}\n```", parse_mode="Markdown")
 
+    async def approvals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show founder-only approval cards with explicit action buttons."""
+        if not allowed_user_id:
+            await update.message.reply_text("Founder approvals are disabled until TELEGRAM_USER_ID is configured.")
+            return
+        if not _is_authorized(update, allowed_user_id):
+            return
+        from jarvis.tools.amaura import get_control_plane
+        approvals = get_control_plane().store.list_approvals("pending")
+        if not approvals:
+            await update.message.reply_text("✅ No founder approvals are pending.")
+            return
+        for item in approvals:
+            payload = item.get("payload", {})
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"amaura:approved:{item['id']}"),
+                InlineKeyboardButton("✏️ Revise", callback_data=f"amaura:changes_requested:{item['id']}"),
+                InlineKeyboardButton("⛔ Reject", callback_data=f"amaura:rejected:{item['id']}"),
+            ]])
+            await update.message.reply_text(
+                f"🛡️ AMAURA APPROVAL\n\n"
+                f"{payload.get('title', 'Company action')}\n"
+                f"Risk: {item['risk'].upper()}\n"
+                f"Action: {item['action_type']}\n"
+                f"Cost: {payload.get('spent_cents', 0)} / {payload.get('budget_cents', 0)} cents\n\n"
+                f"{payload.get('summary', '')[:1200]}",
+                reply_markup=keyboard,
+            )
+
+    async def amaura_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Apply an authenticated founder decision from a Telegram inline button."""
+        query = update.callback_query
+        if not allowed_user_id or str(query.from_user.id) != allowed_user_id:
+            await query.answer("Founder authority required.", show_alert=True)
+            return
+        await query.answer()
+        try:
+            _, decision, approval_id = query.data.split(":", 2)
+            from jarvis.tools.amaura import get_control_plane
+            control = get_control_plane()
+            reason = f"{decision.replace('_', ' ').title()} by {control.founder_name} via authenticated Telegram"
+            result = control.decide_approval(approval_id, control.founder_id, decision, reason)
+            await query.edit_message_text(
+                f"Decision recorded: {decision.upper()}\n"
+                f"Task: {result['task']['title']}\n"
+                f"Audit ID: {approval_id}"
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"Approval could not be recorded: {exc}")
+
+    async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send the daily JARVIS company operating briefing."""
+        if not _is_authorized(update, allowed_user_id):
+            return
+        from jarvis.tools.amaura import get_control_plane
+        briefing = get_control_plane().daily_briefing()
+        status = briefing["company_status"]
+        decisions = briefing["top_founder_decisions"]
+        lines = [
+            "📊 AMAURA DAILY BRIEFING",
+            f"Active programmes: {status['active_programmes']}",
+            f"Blocked tasks: {briefing['projects_blocked']}",
+            f"Completed tasks: {briefing['projects_completed']}",
+            f"Pending approvals: {status['pending_approvals']}",
+            f"Recorded cost: {briefing['costs_incurred_cents']} cents",
+            f"Critical risks: {briefing['critical_risks']}",
+            "",
+            "Top founder decisions:",
+        ]
+        lines.extend(f"• {item['title']} [{item['risk']}]" for item in decisions)
+        if not decisions:
+            lines.append("• None")
+        await update.message.reply_text("\n".join(lines))
+
+    async def resume_agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restore a paused company employee using authenticated founder authority."""
+        if not allowed_user_id:
+            await update.message.reply_text("Founder controls are disabled until TELEGRAM_USER_ID is configured.")
+            return
+        if not _is_authorized(update, allowed_user_id):
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /resume <agent_id> <reviewed reason>")
+            return
+        agent_id, reason = context.args[0], " ".join(context.args[1:])
+        try:
+            from jarvis.tools.amaura import get_control_plane
+            control = get_control_plane()
+            restored = control.resume_agent(agent_id, reason, actor=control.founder_id)
+            await update.message.reply_text(f"✅ {restored['name']} restored. The decision is in the audit log.")
+        except Exception as exc:
+            await update.message.reply_text(f"Employee could not be restored: {exc}")
+
     # ── Build and run the bot ────────────────────────────────────────
 
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("approvals", approvals_command))
+    app.add_handler(CommandHandler("briefing", briefing_command))
+    app.add_handler(CommandHandler("resume", resume_agent_command))
+    app.add_handler(CallbackQueryHandler(amaura_approval_callback, pattern=r"^amaura:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

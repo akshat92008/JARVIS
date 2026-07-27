@@ -29,5 +29,11 @@ fi
 
 # ── Launch Jarvis ────────────────────────────────────────────────────
 cd "$SCRIPT_DIR"
-python -m jarvis "$@"
+
+if [ "$1" = "web" ] || [ "$1" = "hud" ]; then
+    shift
+    python -m jarvis --web "$@"
+else
+    python -m jarvis --no-web "$@"
+fi
 

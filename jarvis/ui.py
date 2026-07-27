@@ -3,19 +3,13 @@ Jarvis UI — Iron Man-styled terminal interface using Rich.
 Cyan/gold color scheme with animated boot sequence and HUD-style formatting.
 """
 
-import os
-import sys
 import time
 import platform
 from datetime import datetime
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.text import Text
 from rich.table import Table
-from rich.columns import Columns
-from rich.markdown import Markdown
-from rich.syntax import Syntax
 from rich import box
 
 # ── Color Palette (Iron Man HUD) ────────────────────────────────────────────
@@ -64,7 +58,8 @@ JARVIS_BANNER = """[bold #ffd700]
 
 def print_boot_sequence(model_name: str = "", working_dir: str = ""):
     """Display the Iron Man-style boot sequence."""
-    console.clear()
+    if console.is_terminal:
+        console.clear()
 
     # Arc Reactor
     console.print(ARC_REACTOR, justify="center")
@@ -85,18 +80,16 @@ def print_boot_sequence(model_name: str = "", working_dir: str = ""):
 
     # Boot steps
     boot_steps = [
-        ("Initializing neural pathways", 0.15),
-        ("Loading language models", 0.15),
-        ("Calibrating safety protocols", 0.1),
-        ("Connecting to NVIDIA API", 0.1),
-        ("Activating tool subsystems", 0.1),
-        ("Loading personal memory", 0.1),
-        ("Systems online", 0.05),
+        "Initializing neural pathways",
+        "Loading language models",
+        "Calibrating safety protocols",
+        "Connecting to NVIDIA API",
+        "Activating tool subsystems",
+        "Loading personal memory",
+        "Systems online",
     ]
 
-    for step_text, delay in boot_steps:
-        with console.status(f"[bold {CYAN}]  ◈ {step_text}...[/]", spinner="dots"):
-            time.sleep(delay)
+    for step_text in boot_steps:
         console.print(f"  [{GREEN}]✓[/] [{WHITE}]{step_text}[/]")
 
     console.print()
@@ -124,7 +117,7 @@ def print_boot_sequence(model_name: str = "", working_dir: str = ""):
         f"  [{GREEN}]●[/] [{WHITE}]All systems operational. At your service, sir.[/]",
     )
     console.print(
-        f"  [{DIM}]Type your request, or use /help for commands. Press Ctrl+C to exit.[/]",
+        f"  [{DIM}]⚡ J.A.R.V.I.S. is fully autonomous — type or speak naturally in plain English.[/]",
     )
     console.print()
 
@@ -166,9 +159,16 @@ def print_tool_call(name: str, args: dict):
             sv = sv[:77] + "..."
         display_args[k] = sv
 
+    extra = ""
+    if name in ("write_file", "edit_file", "create_file"):
+        content = args.get("content", "") or args.get("new_text", "")
+        if content:
+            lines = content.count("\n") + 1
+            extra = f" [{GOLD}]({lines} lines, {len(content):,} chars)[/]"
+
     args_str = ", ".join(f"[{DIM}]{k}=[/][{WHITE}]{v}[/]" for k, v in display_args.items())
 
-    console.print(f"\n  [{ORANGE}]⚡ {name}[/]({args_str})")
+    console.print(f"\n  [{ORANGE}]⚡ {name}[/]({args_str}){extra}")
 
 
 def print_tool_result(result: str, success: bool = True):
@@ -187,7 +187,9 @@ def print_tool_result(result: str, success: bool = True):
     color = GREEN if success else RED
     icon = "✓" if success else "✗"
 
-    if len(display_text) > 200:
+    if result.startswith("✅ Wrote") or result.startswith("✅ Edited"):
+        console.print(f"  [{color}]{icon}[/] [bold {WHITE}]{result.replace('✅ ', '')}[/]")
+    elif len(display_text) > 200:
         console.print(
             Panel(
                 display_text,
@@ -239,41 +241,42 @@ def print_jarvis_speaking(text: str):
 
 def print_help():
     """Display the help panel."""
+    console.print(f"\n  [{GOLD}]⚡ J.A.R.V.I.S. Natural Language Commands[/]")
+    console.print(f"    [{WHITE}]No slash commands needed! Just speak or type in plain English:[/'\n]")
+    console.print(f"    [{CYAN}]• \"Build a FastAPI app with JWT authentication\"[/]")
+    console.print(f"    [{CYAN}]• \"Open Safari and set volume to 50\"[/]")
+    console.print(f"    [{CYAN}]• \"Take a screenshot\"[/]")
+    console.print(f"    [{CYAN}]• \"Fix the bug in server.py and run tests\"[/]")
+    console.print(f"    [{CYAN}]• \"Show system status\"[/]")
+    console.print(f"    [{CYAN}]• \"Undo last edit\" or \"Clear conversation\"[/]")
+    console.print(f"    [{CYAN}]• \"What tools do you have?\"[/]")
+    console.print()
+
     help_table = Table(
-        title=f"[bold {CYAN}]◈ JARVIS COMMANDS ◈[/]",
+        title=f"[bold {CYAN}]◈ SHORTCUTS & OPTIONS ◈[/]",
         border_style=PANEL_BORDER,
         box=box.ROUNDED,
         padding=(0, 1),
     )
-    help_table.add_column("Command", style=f"bold {GOLD}", width=20)
+    help_table.add_column("Shortcut", style=f"bold {GOLD}", width=20)
     help_table.add_column("Description", style=WHITE)
 
     commands = [
-        ("/help", "Show this help panel"),
-        ("/voice", "Toggle voice mode (speak instead of type)"),
-        ("/model <name>", "Switch AI model (e.g., /model kimi-k3)"),
-        ("/models", "List all available models"),
-        ("/research <topic>", "Deep web research on a topic"),
-        ("/ppt <topic>", "Generate a PowerPoint presentation"),
-        ("/desktop", "Show desktop control commands"),
-        ("/memory", "View what Jarvis remembers about you"),
-        ("/remember <fact>", "Teach Jarvis a personal fact"),
-        ("/forget", "Clear personal memory"),
-        ("/history", "View conversation history"),
-        ("/save <file>", "Save conversation to file"),
-        ("/clear", "Clear conversation (start fresh)"),
-        ("/compact", "Compact long conversation"),
-        ("/undo", "Undo last file change"),
-        ("/changes", "Show file changes in this session"),
-        ("/telegram", "Start Telegram bot (for mobile access)"),
-        ("/status", "System status (CPU, RAM, battery)"),
-        ("/exit, /quit", "Exit Jarvis"),
+        ("help / commands", "Show this help panel"),
+        ("voice", "Toggle voice listening mode"),
+        ("models / switch model", "List models or switch active model"),
+        ("tools", "View all 61 active tools"),
+        ("system status", "View CPU, RAM, disk, battery status"),
+        ("memory / remember", "View or add personal memories"),
+        ("undo / revert", "Undo last file change"),
+        ("clear / reset", "Clear conversation history"),
+        ("history", "View past conversation logs"),
+        ("exit / quit / bye", "Exit Jarvis"),
     ]
 
     for cmd, desc in commands:
         help_table.add_row(cmd, desc)
 
-    console.print()
     console.print(help_table)
     console.print()
 

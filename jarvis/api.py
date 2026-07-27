@@ -1,79 +1,209 @@
 """
 NVIDIA API client — OpenAI-compatible wrapper for integrate.api.nvidia.com
-Adapted from Nexus for Jarvis.
+Adapted from Nexus for Jarvis with 3-Key NVIDIA Failover, Groq, and Ollama Local Fallback.
 """
 
-import os
 import json
-from openai import OpenAI
+import os
+import re
+import time
+import certifi
+import httpx
+from openai import OpenAI, BadRequestError
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
+ESSENTIAL_TOOL_NAMES = {
+    "write_file", "edit_file", "read_file", "list_directory", "run_command", "git_status"
+}
+
+AMAURA_TOOL_NAMES = {
+    "amaura_company_status", "amaura_list_agents", "amaura_create_program", "amaura_list_tasks",
+    "amaura_task_packet", "amaura_run_task", "amaura_review_task", "amaura_pending_approvals",
+    "amaura_pause_agent", "amaura_record_decision", "amaura_daily_briefing",
+}
+
+AMAURA_INTENT_TERMS = {
+    "amaura", "company", "workforce", "programme", "program", "founder briefing",
+    "approval", "proposal", "lead qualification", "software delivery", "content campaign",
+    "research experiment", "employee", "department",
+}
+
+
+_env_loaded = False
 
 def _load_env_file():
-    """Load environment variables from .env if present."""
-    if "NVIDIA_API_KEY" in os.environ:
+    """Load environment variables from project .env files (safely cached and guarded)."""
+    global _env_loaded
+    if _env_loaded:
         return
-    
+    _env_loaded = True
+
     possible_paths = [
         os.path.join(os.getcwd(), ".env"),
-        os.path.expanduser("~/Desktop/jarvis/.env"),
         os.path.expanduser("~/Desktop/JARVIS/.env"),
     ]
+    seen_paths = set()
     for p in possible_paths:
-        if os.path.exists(p):
+        p_resolved = os.path.abspath(os.path.expanduser(p))
+        if p_resolved in seen_paths:
+            continue
+        seen_paths.add(p_resolved)
+
+        if os.path.isfile(p_resolved):
             try:
-                with open(p, "r", encoding="utf-8") as f:
+                with open(p_resolved, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith("#") and "=" in line:
                             k, v = line.split("=", 1)
                             k, v = k.strip(), v.strip().strip("'\"")
-                            if k not in os.environ:
+                            if v and (k not in os.environ or not os.environ[k]):
                                 os.environ[k] = v
-                break
             except Exception:
                 pass
 
+    # Load keys from aimodel/config.json
+    aimodel_conf_path = os.path.expanduser("~/Desktop/JARVIS/aimodel/config.json")
+    if os.path.isfile(aimodel_conf_path):
+        try:
+            with open(aimodel_conf_path, "r", encoding="utf-8", errors="ignore") as f:
+                conf = json.load(f)
+
+            if conf.get("nvidia_api_key") and not os.environ.get("NVIDIA_API_KEY"):
+                os.environ["NVIDIA_API_KEY"] = conf["nvidia_api_key"]
+
+            keys_arr = conf.get("nvidia_api_keys", [])
+            for idx, key in enumerate(keys_arr):
+                if key:
+                    os.environ[f"NVIDIA_FALLBACK_API_KEY_AIMODEL_{idx}"] = key
+
+            for provider_key in ["gemini_api_key", "groq_api_key", "cerebras_api_key", "openrouter_api_key"]:
+                val = conf.get(provider_key)
+                env_var_name = provider_key.upper()
+                if val and not os.environ.get(env_var_name):
+                    os.environ[env_var_name] = val
+        except Exception:
+            pass
+
+
+def _filter_essential_tools(tools: list[dict] | None, messages: list[dict] | None = None) -> list[dict] | None:
+    """Select a compact intent-aware tool profile for providers with schema limits."""
+    if not tools:
+        return None
+    latest_user = ""
+    for message in reversed(messages or []):
+        if message.get("role") == "user":
+            latest_user = str(message.get("content", "")).lower()
+            break
+    selected_names = set(ESSENTIAL_TOOL_NAMES)
+    if any(term in latest_user for term in AMAURA_INTENT_TERMS):
+        selected_names.update(AMAURA_TOOL_NAMES)
+    essential = [t for t in tools if t.get("function", {}).get("name") in selected_names]
+    return essential if essential else tools[:6]
+
+
+def _parse_failed_generation(err: Exception) -> tuple[str | None, str | None]:
+    """Parse XML function generation from Groq BadRequestError e.g. <function=name>{json}</function>."""
+    try:
+        body = getattr(err, "body", {})
+        if isinstance(body, dict):
+            failed_gen = body.get("error", {}).get("failed_generation", "")
+            if failed_gen:
+                m = re.search(r'<function=(\w+)>(.*?)(?:</function>|$)', failed_gen, re.DOTALL)
+                if m:
+                    func_name = m.group(1)
+                    raw_args = m.group(2).strip()
+                    try:
+                        parsed = json.loads(raw_args, strict=False)
+                        return func_name, json.dumps(parsed)
+                    except Exception:
+                        path_m = re.search(r'"path"\s*:\s*"([^"]+)"', raw_args)
+                        content_m = re.search(r'"content"\s*:\s*"(.*)"', raw_args, re.DOTALL)
+                        if path_m and content_m:
+                            return func_name, json.dumps({"path": path_m.group(1), "content": content_m.group(1)})
+    except Exception:
+        pass
+    return None, None
+
+
+class SyntheticResponse:
+    """Mock ChatCompletion structure when recovering from failed_generation."""
+    def __init__(self, func_name: str, func_args: str):
+        class Function:
+            def __init__(self, name, arguments):
+                self.name = name
+                self.arguments = arguments
+        class ToolCall:
+            def __init__(self, id, name, arguments):
+                self.id = id
+                self.type = "function"
+                self.function = Function(name, arguments)
+        class Message:
+            def __init__(self, name, arguments):
+                self.content = None
+                self.tool_calls = [ToolCall("call_recovered_" + str(int(time.time())), name, arguments)]
+                self.role = "assistant"
+        class Choice:
+            def __init__(self, name, arguments):
+                self.finish_reason = "tool_calls"
+                self.index = 0
+                self.message = Message(name, arguments)
+
+        self.id = "chatcmpl-recovered-" + str(int(time.time()))
+        self.choices = [Choice(func_name, func_args)]
+
 
 class NvidiaClient:
-    """Thin wrapper around the OpenAI SDK pointed at NVIDIA's endpoint."""
+    """OpenAI-compatible client with 3-key NVIDIA failover, Groq, and Ollama support."""
+
+    _nvidia_disabled_until: float = 0.0
 
     def __init__(self, api_key: str | None = None):
         _load_env_file()
-        self.api_key = api_key or os.environ.get("NVIDIA_API_KEY", "")
+        self.all_keys = []
 
+        primary_key = api_key or os.getenv("NVIDIA_API_KEY", "")
+        if primary_key:
+            self.all_keys.append(primary_key)
 
-        # Load all fallback keys from environment
-        self.fallback_keys = []
         for k in sorted(os.environ.keys()):
-            if k.startswith("NVIDIA_FALLBACK_API_KEY") and os.environ[k]:
-                self.fallback_keys.append(os.environ[k])
+            if (k.startswith("NVIDIA_API_KEY") or k.startswith("NVIDIA_FALLBACK_API_KEY") or k.startswith("NVIDIA_KEY")) and os.environ[k]:
+                val = os.environ[k]
+                if val not in self.all_keys:
+                    self.all_keys.append(val)
 
-        # Deduplicate and remove the primary key if it's in fallbacks
-        self.fallback_keys = [k for k in dict.fromkeys(self.fallback_keys) if k != self.api_key]
-
-        if not self.api_key:
-            raise ValueError(
-                "No NVIDIA API key found. Set NVIDIA_API_KEY env var or pass --api-key."
-            )
-        self.client = OpenAI(
-            base_url=NVIDIA_BASE_URL,
-            api_key=self.api_key,
-            timeout=15.0,
-        )
-
-    def switch_to_fallback(self) -> bool:
-        """Switch to the next fallback API key if available."""
-        if self.fallback_keys:
-            self.api_key = self.fallback_keys.pop(0)
+        self.current_key_idx = 0
+        self.client = None
+        if self.all_keys:
             self.client = OpenAI(
                 base_url=NVIDIA_BASE_URL,
-                api_key=self.api_key,
-                timeout=15.0,
+                api_key=self.all_keys[0],
+                http_client=httpx.Client(verify=certifi.where(), timeout=3.0),
             )
-            return True
-        return False
+
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        self.groq_client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_key,
+            http_client=httpx.Client(verify=certifi.where(), timeout=15.0)
+        ) if groq_key else None
+
+        ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        self.ollama_client = OpenAI(base_url=f"{ollama_url}/v1", api_key="ollama", timeout=5.0)
+
+    def switch_to_fallback(self) -> bool:
+        """Switch to the next available NVIDIA API key."""
+        if len(self.all_keys) <= 1:
+            return False
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.all_keys)
+        new_key = self.all_keys[self.current_key_idx]
+        self.client = OpenAI(
+            base_url=NVIDIA_BASE_URL,
+            api_key=new_key,
+            http_client=httpx.Client(verify=certifi.where(), timeout=3.0)
+        )
+        return True
 
     def chat(
         self,
@@ -82,21 +212,94 @@ class NvidiaClient:
         tools: list[dict] | None = None,
         temperature: float = 0.2,
         max_tokens: int = 16384,
-        stream: bool = True,
+        stream: bool = False,
     ):
-        """Send a chat completion request. Returns a stream or a response."""
+        """Unified chat completion with multi-tier failover."""
         kwargs = {
-            "model": model_id,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": stream,
         }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
 
-        return self.client.chat.completions.create(**kwargs)
+        # ── 1. TRY NVIDIA API KEYS FIRST (If Circuit Breaker isn't tripped) ────
+        if self.client and self.all_keys and time.time() >= NvidiaClient._nvidia_disabled_until:
+            nvidia_model_map = {
+                "gcp-vertex/gemini-2.0-flash-thinking": "meta/llama-3.3-70b-instruct",
+                "jarvis-coder-7b-v1": "meta/llama-3.3-70b-instruct",
+                "deepseek-ai/deepseek-v4-pro": "meta/llama-3.3-70b-instruct",
+                "deepseek-ai/deepseek-v4-flash": "meta/llama-3.3-70b-instruct",
+                "z-ai/glm-5.2": "z-ai/glm-5.2",
+                "moonshotai/kimi-k2.6": "moonshotai/kimi-k2.6",
+                "codestral": "mistralai/codestral-22b-instruct-v0.1",
+                "meta/llama-3.3-70b-instruct": "meta/llama-3.3-70b-instruct",
+            }
+            target_nvidia_model = nvidia_model_map.get(model_id, model_id)
+
+            nv_kwargs = dict(kwargs)
+            nv_kwargs["model"] = target_nvidia_model
+            if tools:
+                # Filter tools for NVIDIA NIM to avoid parameter size overload error
+                nv_kwargs["tools"] = _filter_essential_tools(tools, messages) if len(tools) > 10 else tools
+
+            nvidia_failed = False
+            for _ in range(min(2, len(self.all_keys))):
+                try:
+                    return self.client.chat.completions.create(**nv_kwargs)
+                except Exception:
+                    nvidia_failed = True
+                    break
+
+            if nvidia_failed:
+                # Trip circuit breaker for 120s so subsequent turns use instant Groq failover
+                NvidiaClient._nvidia_disabled_until = time.time() + 120.0
+
+        # ── 2. GROQ AS SECOND TIER FALLBACK ─────────────────────────────────
+        if self.groq_client:
+            groq_model_map = {
+                "gcp-vertex/gemini-2.0-flash-thinking": "llama-3.3-70b-versatile",
+                "jarvis-coder-7b-v1": "llama-3.3-70b-versatile",
+                "meta/llama-3.3-70b-instruct": "llama-3.3-70b-versatile",
+                "meta/llama-3.1-70b-instruct": "llama-3.3-70b-versatile",
+                "deepseek-ai/deepseek-v4-pro": "llama-3.3-70b-versatile",
+                "deepseek-ai/deepseek-v4-flash": "llama-3.3-70b-versatile",
+                "z-ai/glm-5.2": "llama-3.3-70b-versatile",
+                "moonshotai/kimi-k2.6": "llama-3.3-70b-versatile",
+                "mistralai/codestral-22b-instruct-v0.1": "llama-3.3-70b-versatile",
+            }
+            target_groq_model = groq_model_map.get(model_id, "llama-3.3-70b-versatile")
+
+            groq_kwargs = dict(kwargs)
+            groq_kwargs["model"] = target_groq_model
+            groq_kwargs["max_tokens"] = max_tokens
+
+            if tools:
+                groq_kwargs["tools"] = _filter_essential_tools(tools, messages)
+
+            try:
+                return self.groq_client.chat.completions.create(**groq_kwargs)
+            except BadRequestError as bre:
+                func_name, func_args = _parse_failed_generation(bre)
+                if func_name and func_args:
+                    return SyntheticResponse(func_name, func_args)
+            except Exception:
+                pass
+
+        # ── 3. OLLAMA LOCAL FALLBACK ──────────────────────────────────────────
+        try:
+            ollama_kwargs = dict(kwargs)
+            ollama_kwargs["model"] = "qwen2.5-coder:1.5b"
+            if tools:
+                ollama_kwargs["tools"] = _filter_essential_tools(tools, messages)[:16]
+            return self.ollama_client.chat.completions.create(**ollama_kwargs)
+        except Exception:
+            try:
+                ollama_kwargs.pop("tools", None)
+                return self.ollama_client.chat.completions.create(**ollama_kwargs)
+            except Exception:
+                pass
+
+        raise RuntimeError("All AI model backend providers (NVIDIA NIM, Groq, Ollama) failed. Please check network connection and API key configurations.")
 
     def chat_sync(
         self,

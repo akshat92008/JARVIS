@@ -1,28 +1,54 @@
 """
-Model registry — all top-tier models available on NVIDIA's free API catalog.
-Adapted from Nexus for Jarvis.
+Model registry & Smart Hybrid Router — all top-tier models and GCP fine-tuned endpoint router.
 """
 
+
 MODELS = {
+    # ── GCP Fable 5 Adaptive Reasoning ─────────────────────────────
+    "fable-5-reasoning": {
+        "id": "gcp-vertex/gemini-2.0-flash-thinking",
+        "name": "JARVIS Fable 5 Engine (GCP)",
+        "category": "reasoning",
+        "context": 1048576,
+        "description": "Claude Fable 5 level adaptive thinking & reasoning powered by GCP Vertex AI & DeepSeek R1",
+        "supports_tools": True,
+    },
+    # ── Custom Fine-Tuned GCP Model ───────────────────────────────────
+    "jarvis-coder-7b": {
+        "id": "jarvis-coder-7b-v1",
+        "name": "JARVIS Coder 32B (GCP Hosted)",
+        "category": "coding",
+        "context": 131072,
+        "description": "Custom fine-tuned Qwen 2.5 Coder 32B hosted on GCP Compute Engine GPU VM ($300 Credit)",
+        "supports_tools": True,
+    },
     # ── Flagship Reasoning & Coding ──────────────────────────────────
+    "llama-3.3-70b": {
+        "id": "meta/llama-3.1-70b-instruct",
+        "name": "Llama 3.3 70B",
+        "category": "coding",
+        "context": 128000,
+        "description": "Meta's flagship 70B — super fast, elite tool calling & agentic coding",
+        "supports_tools": True,
+    },
     "deepseek-v4": {
         "id": "deepseek-ai/deepseek-v4-pro",
         "name": "DeepSeek V4 Pro",
         "category": "reasoning",
         "context": 131072,
-        "description": "MoE flagship — 1M context, top-tier reasoning & code",
+        "description": "DeepSeek flagship MoE — 128k context, top-tier reasoning & code",
         "supports_tools": True,
     },
-    "deepseek-r1": {
-        "id": "deepseek-ai/deepseek-r1",
-        "name": "DeepSeek R1",
-        "category": "reasoning",
+    "deepseek-flash": {
+        "id": "deepseek-ai/deepseek-v4-flash",
+        "name": "DeepSeek V4 Flash",
+        "category": "coding",
         "context": 131072,
-        "description": "Deep reasoning model with chain-of-thought",
-        "supports_tools": False,
+        "description": "Ultra-fast DeepSeek MoE for rapid code generation & tool use",
+        "supports_tools": True,
     },
     "glm-5.2": {
-        "id": "thudm/glm-5.2",
+        "id": "z-ai/glm-5.2",
         "name": "GLM 5.2",
         "category": "reasoning",
         "context": 131072,
@@ -34,107 +60,81 @@ MODELS = {
         "name": "Kimi K2.6",
         "category": "coding",
         "context": 131072,
-        "description": "Multimodal MoE — optimized for coding & tool use",
+        "description": "Multimodal MoE by Moonshot AI — optimized for coding & tool use",
         "supports_tools": True,
     },
-    "kimi-k3": {
-        "id": "moonshotai/kimi-k3",
-        "name": "Kimi K3",
-        "category": "reasoning",
-        "context": 131072,
-        "description": "Moonshot AI's next-gen reasoning and coding model",
-        "supports_tools": True,
-    },
-    "glm-5": {
-        "id": "thudm/glm-5",
-        "name": "GLM 5",
-        "category": "reasoning",
-        "context": 131072,
-        "description": "Zhipu AI's flagship multi-modal reasoning and agentic model",
-        "supports_tools": True,
-    },
-    "deepseek-r1-distill-llama-70b": {
-        "id": "nvidia/deepseek-r1-distill-llama-70b",
-        "name": "DeepSeek R1 Distill Llama 70B",
-        "category": "reasoning",
-        "context": 131072,
-        "description": "DeepSeek R1 reasoning style distilled on Llama 70B by NVIDIA",
-        "supports_tools": True,
-    },
-    "minimax-m3": {
-        "id": "minimax/minimax-m3",
-        "name": "MiniMax M3",
-        "category": "general",
-        "context": 131072,
-        "description": "High-performance Mixture-of-Experts model by MiniMax",
-        "supports_tools": True,
-    },
-    "llama-3.3-70b": {
-        "id": "meta/llama-3.3-70b-instruct",
-        "name": "Llama 3.3 70B",
-        "category": "general",
-        "context": 131072,
-        "description": "Meta's state-of-the-art 70B instruction-tuned model",
-        "supports_tools": True,
-    },
-    "llama-3.1-70b": {
-        "id": "meta/llama-3.1-70b-instruct",
-        "name": "Llama 3.1 70B",
-        "category": "general",
-        "context": 131072,
-        "description": "Meta's highly capable 70B instruction-tuned model",
-        "supports_tools": True,
-    },
-    # ── NVIDIA Nemotron Family ───────────────────────────────────────
-    "nemotron-ultra": {
-        "id": "nvidia/nemotron-3-ultra-550b-a55b",
-        "name": "Nemotron Ultra 550B",
-        "category": "reasoning",
-        "context": 131072,
-        "description": "NVIDIA flagship — agentic reasoning, 550B params",
-        "supports_tools": True,
-    },
-    "nemotron-super": {
-        "id": "nvidia/llama-3.1-nemotron-70b-instruct",
-        "name": "Nemotron 70B",
-        "category": "general",
-        "context": 131072,
-        "description": "Fine-tuned Llama 3.1 70B by NVIDIA",
-        "supports_tools": True,
-    },
-    # ── Qwen Family ─────────────────────────────────────────────────
-    "qwen-2.5-72b": {
-        "id": "qwen/qwen2.5-72b-instruct",
-        "name": "Qwen 2.5 72B",
-        "category": "general",
-        "context": 131072,
-        "description": "Alibaba's 72B flagship — strong code & math",
-        "supports_tools": True,
-    },
-    "qwen-coder": {
-        "id": "qwen/qwen2.5-coder-32b-instruct",
-        "name": "Qwen 2.5 Coder 32B",
+    "codestral": {
+        "id": "mistralai/codestral-22b-instruct-v0.1",
+        "name": "Codestral 22B",
         "category": "coding",
-        "context": 65536,
-        "description": "Specialized coding model by Alibaba",
+        "context": 32768,
+        "description": "Mistral AI's specialized model for code generation & editing",
         "supports_tools": True,
     },
+    "llama-vision": {
+        "id": "meta/llama-3.2-90b-vision-instruct",
+        "name": "Llama 3.2 90B Vision",
+        "category": "vision",
+        "context": 128000,
+        "description": "Multimodal vision flagship model for UI inspection and image perception",
+        "supports_tools": True,
+    }
 }
 
-# Aliases for convenience
 ALIASES = {
+    "fable": "fable-5-reasoning",
+    "fable5": "fable-5-reasoning",
+    "fable-5-engine": "fable-5-reasoning",
+    "fable5-engine": "fable-5-reasoning",
+    "mythos": "fable-5-reasoning",
+    "aimodel": "fable-5-reasoning",
+    "gcp": "fable-5-reasoning",
+    "llama": "llama-3.3-70b",
+    "llama3": "llama-3.3-70b",
     "deepseek": "deepseek-v4",
     "ds": "deepseek-v4",
-    "r1": "deepseek-r1",
+    "flash": "deepseek-flash",
     "glm": "glm-5.2",
-    "kimi": "kimi-k3",
-    "minimax": "minimax-m3",
-    "llama": "llama-3.3-70b",
-    "nemotron": "nemotron-ultra",
-    "qwen": "qwen-2.5-72b",
+    "kimi": "kimi-k2.6",
+    "code": "codestral",
+    "vision": "llama-vision",
 }
 
-DEFAULT_MODEL = "llama-3.1-70b"
+DEFAULT_MODEL = "llama-3.3-70b"
+
+
+class SmartHybridModelRouter:
+    """Intelligent query classification & multi-modal model selection engine."""
+    
+    @staticmethod
+    def classify_intent(prompt: str) -> str:
+        p = prompt.lower()
+        if any(w in p for w in ["screenshot", "webcam", "image", "visual", "look at", "see user", "ui layout", "inspect ui"]):
+            return "vision"
+        if any(w in p for w in ["browser", "navigate", "click", "web page", "scrape", "url", "playwright"]):
+            return "browser"
+        if any(w in p for w in ["architecture", "refactor", "system design", "security review", "audit", "math", "proof", "fable"]):
+            return "reasoning"
+        if any(w in p for w in ["speak", "listen", "voice", "duplex", "barge in"]):
+            return "voice"
+        if any(w in p for w in ["plan", "roadmap", "repository plan", "tdd"]):
+            return "planning"
+        if any(w in p for w in ["summarize", "briefing", "summary"]):
+            return "summarization"
+        return "coding"
+
+    @classmethod
+    def route_query(cls, prompt: str) -> str:
+        intent = cls.classify_intent(prompt)
+        
+        if intent == "vision":
+            return "llama-vision"
+        elif intent in ["reasoning", "coding", "planning"]:
+            return "fable-5-reasoning"
+        elif intent in ["browser", "summarization"]:
+            return "llama-3.3-70b"
+        
+        return DEFAULT_MODEL
 
 
 def resolve_model(key: str) -> dict | None:
@@ -144,9 +144,8 @@ def resolve_model(key: str) -> dict | None:
         return MODELS[key]
     if key in ALIASES:
         return MODELS[ALIASES[key]]
-    # Fuzzy match
     for name, cfg in MODELS.items():
-        if key in name or key in cfg["name"].lower():
+        if key in name or key in str(cfg.get("name", "")).lower():
             return cfg
     return None
 
@@ -159,3 +158,4 @@ def list_models() -> list[dict]:
         entry["key"] = key
         result.append(entry)
     return result
+

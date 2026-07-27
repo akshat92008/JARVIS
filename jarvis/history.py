@@ -3,16 +3,14 @@ File Change History — tracks every file modification for undo/diff support.
 Adapted from Nexus for Jarvis. Stored in ~/.jarvis/history/.
 """
 
-import os
 import json
-import difflib
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from jarvis.paths import get_data_dir
 
 
-HISTORY_DIR = Path.home() / ".jarvis" / "history"
+HISTORY_DIR = get_data_dir() / "history"
 
 
 class FileHistory:

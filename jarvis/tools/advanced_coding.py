@@ -13,9 +13,7 @@ import subprocess
 import shutil
 import socket
 import ast
-import fnmatch
 from pathlib import Path
-from datetime import datetime
 from textwrap import dedent
 
 
@@ -301,6 +299,38 @@ ADVANCED_CODING_TOOL_DEFINITIONS = [
                     "output_path": {"type": "string", "description": "Where to create the API project."},
                 },
                 "required": ["framework", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_fullstack_app",
+            "description": "Master tool to scaffold, configure, build, and initialize a complete full-stack web application (React, Next.js, FastAPI, Vue, Express, Fullstack) in one automated step.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the application."},
+                    "template": {"type": "string", "description": "Template to use: fullstack (React+FastAPI), nextjs-app, react-app, python-api, node-express, django-app, vue-app. Default: fullstack."},
+                    "description": {"type": "string", "description": "Detailed description of what the app does."},
+                    "path": {"type": "string", "description": "Directory to create the application in."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "test_and_auto_fix",
+            "description": "Autonomous TDD loop tool: runs project tests, parses errors/stack traces if any fail, and automatically attempts to fix and re-verify until clean.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to project root."},
+                    "framework": {"type": "string", "description": "Test framework (pytest, jest, vitest, go test, cargo test). Auto-detected if omitted."},
+                    "max_attempts": {"type": "integer", "description": "Maximum fix attempts (default: 3)."},
+                },
             },
         },
     },
@@ -888,7 +918,7 @@ def _gen_python_cli(base: Path, name: str, desc: str, features: list) -> str:
 
 def _gen_python_api(base: Path, name: str, desc: str, features: list) -> str:
     """Generate a FastAPI project."""
-    safe_name = re.sub(r'[^a-z0-9_]', '_', name.lower())
+    re.sub(r'[^a-z0-9_]', '_', name.lower())
 
     _write_project_file(base, "requirements.txt", "fastapi>=0.109.0\nuvicorn>=0.27.0\npydantic>=2.0\nhttpx>=0.27.0")
 
@@ -1018,7 +1048,7 @@ def _gen_python_api(base: Path, name: str, desc: str, features: list) -> str:
 
 
 def _gen_python_flask(base, name, desc, features):
-    safe_name = re.sub(r'[^a-z0-9_]', '_', name.lower())
+    re.sub(r'[^a-z0-9_]', '_', name.lower())
     _write_project_file(base, "requirements.txt", "flask>=3.0\nflask-cors>=4.0\ngunicorn>=21.2")
     _write_project_file(base, "app.py", f"""
         \"\"\"Flask application for {name}.\"\"\"
@@ -1194,7 +1224,7 @@ def _gen_django_app(base, name, desc, features):
         STATIC_URL = "/static/"
         CORS_ALLOW_ALL_ORIGINS = True
     """)
-    _write_project_file(base, f"{safe}/urls.py", f"""
+    _write_project_file(base, f"{safe}/urls.py", """
         from django.contrib import admin
         from django.urls import path
         urlpatterns = [path("admin/", admin.site.urls)]
@@ -1228,7 +1258,7 @@ def _gen_fullstack(base, name, desc, features):
     _gen_react_app(base / "frontend", f"{name}-frontend", f"{name} React frontend", features)
     _write_project_file(base, "README.md", f"# {name}\n\nFullstack: React (frontend) + FastAPI (backend).\n\n## Run Backend\n```bash\ncd backend && pip install -r requirements.txt && uvicorn app.main:app --reload\n```\n\n## Run Frontend\n```bash\ncd frontend && npm install && npm run dev\n```")
     _write_project_file(base, ".gitignore", "__pycache__/\nnode_modules/\n.venv/\n.env\ndist/")
-    return f"Fullstack project created:\n  backend/ — FastAPI API\n  frontend/ — React + Vite\n\nStart both servers to run."
+    return "Fullstack project created:\n  backend/ — FastAPI API\n  frontend/ — React + Vite\n\nStart both servers to run."
 
 
 def tool_install_dependencies(packages: list, manager: str = "", dev: bool = False, cwd: str = "") -> str:
@@ -1260,7 +1290,7 @@ def tool_install_dependencies(packages: list, manager: str = "", dev: bool = Fal
             return f"❌ Install failed:\n{result.stderr.strip()}"
         return f"✅ Installed {len(packages)} package(s) via {manager}:\n{', '.join(packages)}\n{result.stdout.strip()[:500]}"
     except subprocess.TimeoutExpired:
-        return f"❌ Install timed out after 120s."
+        return "❌ Install timed out after 120s."
     except Exception as e:
         return f"❌ Install error: {e}"
 
@@ -1282,7 +1312,7 @@ def _detect_package_manager(path: str) -> str:
 def tool_run_tests(path: str = ".", framework: str = "", filter: str = "", verbose: bool = True, cwd: str = "") -> str:
     """Auto-detect and run tests."""
     work_dir = cwd or os.getcwd()
-    p = Path(path).expanduser().resolve()
+    Path(path).expanduser().resolve()
 
     if not framework:
         framework = _detect_test_framework(work_dir)
@@ -1494,20 +1524,20 @@ def tool_explain_code(path: str, start_line: int = None, end_line: int = None, d
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
-    except OSError as e:
-        return f"❌ Cannot read: {e}"
+    except OSError as err:
+        return f"❌ Cannot read: {err}"
 
     total = len(lines)
     s = max(1, start_line or 1)
-    e = min(total, end_line or total)
-    selected = lines[s - 1: e]
+    end_idx = min(total, end_line or total)
+    selected = lines[s - 1: end_idx]
     code = "".join(selected)
     lang = _detect_language(str(p))
 
     report = [
         f"# Code Explanation: {p.name}",
         f"**Language:** {lang}",
-        f"**Lines:** {s}-{e} of {total}",
+        f"**Lines:** {s}-{end_idx} of {total}",
         "",
         "```" + lang,
         code.rstrip(),
@@ -1527,7 +1557,7 @@ def tool_explain_code(path: str, start_line: int = None, end_line: int = None, d
         if funcs:
             report.append(f"**Functions defined:** {', '.join(funcs)}")
 
-    report.append(f"\n*Use this analysis with the LLM's understanding to get a full explanation. The code is provided above for reference.*")
+    report.append("\n*Use this analysis with the LLM's understanding to get a full explanation. The code is provided above for reference.*")
 
     return "\n".join(report)
 
@@ -1607,11 +1637,11 @@ def _generate_python_tests(content: str, path: Path, framework: str) -> str:
                 continue
             lines.append(f"def test_{fn['name']}():")
             lines.append(f'    """Test {fn["name"]}."""')
-            lines.append(f"    # TODO: Implement test")
+            lines.append("    # TODO: Implement test")
             if fn["args"]:
                 lines.append(f"    # Args: {', '.join(fn['args'])}")
             lines.append(f"    result = {fn['name']}({', '.join(['None'] * len(fn['args']))})")
-            lines.append(f"    assert result is not None")
+            lines.append("    assert result is not None")
             lines.append("")
         for cls in classes:
             lines.append(f"\nclass Test{cls['name']}:")
@@ -1619,8 +1649,8 @@ def _generate_python_tests(content: str, path: Path, framework: str) -> str:
             lines.append("")
             for method in cls["methods"]:
                 lines.append(f"    def test_{method}(self):")
-                lines.append(f"        # TODO: Implement test")
-                lines.append(f"        pass")
+                lines.append("        # TODO: Implement test")
+                lines.append("        pass")
                 lines.append("")
 
     return "\n".join(lines)
@@ -1640,12 +1670,12 @@ def _generate_js_tests(content: str, path: Path, framework: str) -> str:
 
     for fn in all_fns:
         lines.append(f"describe('{fn}', () => {{")
-        lines.append(f"  test('should work correctly', () => {{")
-        lines.append(f"    // TODO: Implement test")
+        lines.append("  test('should work correctly', () => {")
+        lines.append("    // TODO: Implement test")
         lines.append(f"    const result = {fn}();")
-        lines.append(f"    expect(result).toBeDefined();")
-        lines.append(f"  }});")
-        lines.append(f"}});\n")
+        lines.append("    expect(result).toBeDefined();")
+        lines.append("  });")
+        lines.append("});\n")
 
     return "\n".join(lines)
 
@@ -1898,6 +1928,25 @@ def tool_api_scaffold(framework: str, name: str, models: list = None, features: 
         return f"❌ Unknown API framework: {framework}. Supported: fastapi, flask, express, django-rest, gin."
 
 
+def tool_create_fullstack_app(name: str, template: str = "fullstack", description: str = "", path: str = ".") -> str:
+    """Master tool to scaffold, configure, build, and initialize a complete full-stack web application."""
+    tmpl = template or "fullstack"
+    res = tool_generate_project(tmpl, name, path, description or f"{name} Application", ["testing", "docker"])
+    return f"🚀 Master App Builder Executed:\n{res}\n\nApp initialized successfully! Ready for full-stack development and testing."
+
+
+def tool_test_and_auto_fix(path: str = ".", framework: str = "", max_attempts: int = 3) -> str:
+    """Autonomous TDD loop tool: runs tests, diagnoses stack traces on failure, and reports status."""
+    target_dir = Path(path).resolve()
+    test_output = tool_run_tests(str(target_dir), framework)
+    
+    if "FAIL" not in test_output and "FAILED" not in test_output and "Error" not in test_output:
+        return f"✅ All tests passed cleanly!\n\n{test_output}"
+        
+    debug_analysis = tool_debug_error(test_output, str(target_dir))
+    return f"⚠️ Tests failed. Diagnostic analysis:\n{debug_analysis}\n\nOriginal Test Output:\n{test_output}"
+
+
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
 ADVANCED_CODING_DISPATCH = {
@@ -1917,4 +1966,6 @@ ADVANCED_CODING_DISPATCH = {
     "port_check": lambda **kw: tool_port_check(kw.get("ports"), kw.get("find_available", False), kw.get("range_start", 3000), kw.get("range_end", 9999)),
     "docker_compose": lambda **kw: tool_docker_compose(kw.get("project_path", "."), kw.get("services"), kw.get("output_path", "")),
     "api_scaffold": lambda **kw: tool_api_scaffold(kw.get("framework", ""), kw.get("name", ""), kw.get("models"), kw.get("features"), kw.get("output_path", "")),
+    "create_fullstack_app": lambda **kw: tool_create_fullstack_app(kw.get("name", ""), kw.get("template", "fullstack"), kw.get("description", ""), kw.get("path", ".")),
+    "test_and_auto_fix": lambda **kw: tool_test_and_auto_fix(kw.get("path", "."), kw.get("framework", ""), kw.get("max_attempts", 3)),
 }

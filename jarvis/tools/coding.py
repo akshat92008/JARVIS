@@ -5,16 +5,12 @@ Ported from Nexus tools.py for Jarvis.
 
 import os
 import re
-import json
 import subprocess
 import fnmatch
-import hashlib
-import mimetypes
 import urllib.request
 import urllib.error
 import html
 from pathlib import Path
-from datetime import datetime
 
 from jarvis.history import get_history
 
@@ -258,20 +254,20 @@ def tool_read_file(path: str, start_line: int | None = None, end_line: int | Non
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
-    except OSError as e:
-        return f"❌ Cannot read {path}: {e}"
+    except OSError as err:
+        return f"❌ Cannot read {path}: {err}"
 
     total = len(lines)
     s = max(1, start_line or 1)
-    e = min(total, end_line or total)
+    end_idx = min(total, end_line or total)
 
     if s > total:
         return f"❌ start_line ({s}) exceeds file length ({total} lines)."
 
-    selected = lines[s - 1 : e]
+    selected = lines[s - 1 : end_idx]
     numbered = [f"{i}: {line.rstrip()}" for i, line in enumerate(selected, s)]
 
-    header = f"File: {p} ({total} lines)\nShowing lines {s}-{e}:\n"
+    header = f"File: {p} ({total} lines)\nShowing lines {s}-{end_idx}:\n"
     return header + "\n".join(numbered)
 
 

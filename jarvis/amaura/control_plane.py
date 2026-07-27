@@ -1,0 +1,538 @@
+"""JARVIS: the master orchestrator and authority boundary for all Amaura agents."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from jarvis.amaura.model_gateway import ModelGateway
+from jarvis.amaura.models import ApprovalStatus, GovernanceError, RiskLevel, TaskState
+from jarvis.amaura.pipeline import AcquisitionPipeline
+from jarvis.amaura.content_factory import ContentFactory
+from jarvis.amaura.policy import PolicyEngine, tool_risk_class
+from jarvis.amaura.policies import POLICIES, policies_for
+from jarvis.amaura.prompts import PROMPT_VERSION
+from jarvis.amaura.registry import AGENTS_BY_ID, ALL_AGENTS, get_agent
+from jarvis.amaura.store import CompanyStore
+from jarvis.amaura.workflows import WORKFLOWS, get_workflow
+
+
+def _id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+class AmauraControlPlane:
+    """The only service allowed to create, delegate, review, or approve company work."""
+
+    def __init__(self, db_path: str | Path | None = None, founder_id: str | None = None):
+        self.store = CompanyStore(db_path)
+        self.founder_id = founder_id or os.environ.get("AMAURA_FOUNDER_ID", "founder")
+        self.founder_name = os.environ.get("AMAURA_FOUNDER_NAME", "Akshat")
+        self.policy = PolicyEngine()
+        self.models = ModelGateway()
+        self.acquisition = AcquisitionPipeline(self.store, self.founder_id)
+        self.content_factory = ContentFactory(self.store, self.founder_id)
+        self.bootstrap()
+
+    def close(self) -> None:
+        self.store.close()
+
+    def bootstrap(self) -> dict[str, Any]:
+        for agent in ALL_AGENTS:
+            self.store.upsert_agent(agent.to_dict())
+        for policy_name, policy in POLICIES.items():
+            self.store.upsert_knowledge(
+                "company_policies", policy_name, policy, [], "internal", "jarvis"
+            )
+        self.store.publish_event(
+            "company.control_plane.ready", "jarvis",
+            {"agents": len(ALL_AGENTS), "founder": self.founder_name, "workflows": list(WORKFLOWS)},
+        )
+        return {"master": "jarvis", "agents": len(ALL_AGENTS), "workflows": list(WORKFLOWS)}
+
+    def create_program(
+        self,
+        *,
+        objective: str,
+        success_metric: str,
+        workflow_key: str,
+        title: str | None = None,
+        priority: int = 3,
+        deadline: str | None = None,
+        inputs: dict[str, Any] | None = None,
+        actor: str = "jarvis",
+    ) -> dict[str, Any]:
+        if actor != "jarvis":
+            raise GovernanceError("Only JARVIS may translate objectives into company programmes")
+        if not objective.strip() or not success_metric.strip():
+            raise GovernanceError("Every programme requires an objective and measurable success metric")
+        if not 1 <= priority <= 5:
+            raise GovernanceError("Priority must be between 1 (highest) and 5 (lowest)")
+        workflow = get_workflow(workflow_key)
+        supplied = inputs or {}
+        workspace = Path(supplied.get("repository_path") or supplied.get("workspace") or os.getcwd()).expanduser().resolve()
+        if not workspace.exists() or not workspace.is_dir():
+            raise GovernanceError(f"Assigned workspace does not exist or is not a directory: {workspace}")
+        supplied = {**supplied, "workspace": str(workspace)}
+        missing = [key for key in workflow.required_inputs if not supplied.get(key)]
+        if missing:
+            raise GovernanceError(f"Workflow requires input(s): {', '.join(missing)}")
+        if workflow.key == "client_acquisition":
+            try:
+                self.store.get_campaign(str(supplied["campaign_id"]))
+            except KeyError:
+                self.acquisition.create_campaign(
+                    campaign_id=str(supplied["campaign_id"]),
+                    name=str(supplied.get("campaign_name") or supplied["campaign_id"]),
+                    target_segment=str(supplied["target_segment"]), offer=str(supplied["offer"]),
+                    minimum_score=int(supplied.get("minimum_score", 70)),
+                    daily_lead_limit=int(supplied.get("daily_lead_limit", 10)),
+                    daily_outreach_limit=int(supplied.get("daily_outreach_limit", 3)),
+                    daily_followup_limit=int(supplied.get("daily_followup_limit", 5)),
+                    maximum_followups=int(supplied.get("maximum_followups", 2)),
+                    config={"proof_assets": supplied.get("proof_assets", []), "regions": supplied.get("regions", [])},
+                )
+        elif workflow.key == "content_factory":
+            try:
+                self.store.get_content_campaign(str(supplied["campaign_id"]))
+            except KeyError:
+                self.content_factory.create_campaign(
+                    campaign_id=str(supplied["campaign_id"]), title=title or objective[:100],
+                    audience=str(supplied["audience"]),
+                    business_objective=str(supplied["business_objective"]), config=supplied,
+                )
+
+        programme_id, project_id, milestone_id = _id("prog"), _id("proj"), _id("mile")
+        programme_title = title or objective.strip()[:100]
+        base = {
+            "workflow_id": workflow.key,
+            "owner_id": "jarvis",
+            "state": TaskState.ASSIGNED.value,
+            "priority": priority,
+            "deadline": deadline,
+            "success_metric": success_metric,
+            "metadata": {"inputs": supplied},
+        }
+        self.store.insert_work_item({
+            **base, "id": programme_id, "parent_id": None, "item_type": "programme",
+            "title": programme_title, "description": objective,
+        })
+        self.store.insert_work_item({
+            **base, "id": project_id, "parent_id": programme_id, "item_type": "project",
+            "title": workflow.name, "description": f"Execute the {workflow.name} workflow for: {objective}",
+        })
+        self.store.insert_work_item({
+            **base, "id": milestone_id, "parent_id": project_id, "item_type": "milestone",
+            "title": f"Complete {workflow.name}", "description": success_metric,
+        })
+
+        step_ids = {step.key: _id("task") for step in workflow.steps}
+        tasks: list[dict[str, Any]] = []
+        for step in workflow.steps:
+            task = self.store.insert_work_item({
+                "id": step_ids[step.key],
+                "parent_id": milestone_id,
+                "item_type": "task",
+                "workflow_id": workflow.key,
+                "title": step.title,
+                "description": step.description,
+                "owner_id": step.owner_id,
+                "reviewer_id": step.reviewer_id,
+                "state": TaskState.ASSIGNED.value,
+                "priority": priority,
+                "deadline": deadline,
+                "budget_cents": step.budget_cents,
+                "risk": step.risk.value,
+                "action_type": step.action_type,
+                "success_metric": success_metric,
+                "acceptance_criteria": list(step.acceptance_criteria),
+                "dependencies": [step_ids[key] for key in step.depends_on],
+                "metadata": {
+                    "step_key": step.key, "programme_id": programme_id, "inputs": supplied,
+                    "workspace": str(workspace), "sensitivity": supplied.get("sensitivity", "internal"),
+                    "prompt_profile": step.prompt_profile,
+                },
+            })
+            decision = self.policy.validate_assignment(task)
+            if not decision.allowed:
+                self.store.audit(actor, "assign", "task", task["id"], "denied", decision.to_dict())
+                raise GovernanceError("; ".join(decision.reasons))
+            self.store.audit(actor, "assign", "task", task["id"], "allowed", {"owner": step.owner_id})
+            tasks.append(task)
+
+        self.store.publish_event(
+            "project.created", programme_id,
+            {"objective": objective, "workflow": workflow.key, "tasks": len(tasks), "success_metric": success_metric},
+        )
+        self.store.audit(actor, "create_program", "programme", programme_id, "allowed", {"workflow": workflow.key})
+        return {
+            "programme": self.store.get_work_item(programme_id),
+            "project_id": project_id,
+            "milestone_id": milestone_id,
+            "tasks": tasks,
+        }
+
+    def task_packet(self, task_id: str, actor: str = "jarvis") -> dict[str, Any]:
+        if actor != "jarvis":
+            raise GovernanceError("Only JARVIS may assemble and issue task context")
+        task = self._task(task_id)
+        self._ensure_agent_enabled(task["owner_id"])
+        agent = get_agent(task["owner_id"])
+        dependency_cards = [self.store.get_work_item(dep) for dep in task["dependencies"]]
+        remaining = task["budget_cents"] - task["spent_cents"]
+        route = self.models.route(
+            agent.agent_id,
+            risk=task["risk"],
+            sensitivity=task["metadata"].get("sensitivity", "internal"),
+            estimated_tokens=task["metadata"].get("estimated_tokens", 4000),
+            remaining_budget_cents=max(0, remaining),
+        )
+        packet = {
+            "issued_by": "jarvis",
+            "task_id": task["id"],
+            "title": task["title"],
+            "objective": task["description"],
+            "success_metric": task["success_metric"],
+            "acceptance_criteria": task["acceptance_criteria"],
+            "owner": {"id": agent.agent_id, "name": agent.name, "department": agent.department},
+            "reviewer_id": task["reviewer_id"],
+            "approved_tools": list(agent.tools),
+            "tool_risk_classes": {name: tool_risk_class(name) for name in agent.tools},
+            "permissions": list(agent.permissions),
+            "approved_data": list(agent.data_access),
+            "budget": {"limit_cents": task["budget_cents"], "spent_cents": task["spent_cents"], "remaining_cents": remaining},
+            "risk": task["risk"],
+            "action_type": task["action_type"],
+            "dependencies": [
+                {"id": dep["id"], "title": dep["title"], "state": dep["state"], "evidence": dep["evidence"]}
+                for dep in dependency_cards
+            ],
+            "model_route": route.to_dict(),
+            "prompt": {"profile": task["metadata"].get("prompt_profile"), "version": PROMPT_VERSION},
+            "workspace": task["metadata"].get("workspace"),
+            "policies": policies_for(task["action_type"]),
+            "doctrine": [
+                "Do not exceed this task packet.",
+                "Attach evidence for every completion claim.",
+                "Do not certify your own work.",
+                "Stop and escalate any unapproved tool, data, cost, or external action.",
+            ],
+        }
+        self.store.audit(actor, "issue_task_packet", "task", task_id, "allowed", {"owner": agent.agent_id})
+        return packet
+
+    def start_task(self, task_id: str, actor: str = "jarvis") -> dict[str, Any]:
+        if actor != "jarvis":
+            raise GovernanceError("Only JARVIS may dispatch company tasks")
+        task = self._task(task_id)
+        self._ensure_agent_enabled(task["owner_id"])
+        if task["state"] not in {TaskState.ASSIGNED.value, TaskState.BLOCKED.value}:
+            raise GovernanceError(f"Task cannot start from state '{task['state']}'")
+        incomplete = [dep for dep in task["dependencies"] if self.store.get_work_item(dep)["state"] != TaskState.COMPLETED.value]
+        if incomplete:
+            updated = self.store.update_work_item(task_id, state=TaskState.BLOCKED.value)
+            self.store.publish_event("task.blocked", task_id, {"dependencies": incomplete})
+            self.store.audit(actor, "start", "task", task_id, "denied", {"incomplete_dependencies": incomplete})
+            return updated
+        updated = self.store.update_work_item(task_id, state=TaskState.IN_PROGRESS.value)
+        self.store.publish_event("task.started", task_id, {"owner": task["owner_id"]})
+        self.store.audit(actor, "start", "task", task_id, "allowed", {"owner": task["owner_id"]})
+        return updated
+
+    def authorize_tool(self, task_id: str, agent_id: str, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        task = self._task(task_id)
+        decision = self.policy.validate_tool_action(task, agent_id, tool_name, args)
+        outcome = "allowed" if decision.allowed else "denied"
+        self.store.audit(agent_id, f"tool:{tool_name}", "task", task_id, outcome, decision.to_dict())
+        if not decision.allowed:
+            raise GovernanceError("; ".join(decision.reasons))
+        return decision.to_dict()
+
+    def submit_task(self, task_id: str, actor: str, summary: str, evidence: list[dict[str, Any]]) -> dict[str, Any]:
+        task = self._task(task_id)
+        if actor != task["owner_id"]:
+            raise GovernanceError("Only the assigned employee may submit this task")
+        if task["state"] != TaskState.IN_PROGRESS.value:
+            raise GovernanceError("Only in-progress tasks may be submitted")
+        if not summary.strip() or not evidence:
+            raise GovernanceError("Submission requires a result summary and verifiable evidence")
+        for item in evidence:
+            if not item.get("type") or not item.get("reference"):
+                raise GovernanceError("Each evidence item requires 'type' and 'reference'")
+        next_state = TaskState.AWAITING_APPROVAL if task["reviewer_id"] == "founder" else TaskState.AWAITING_REVIEW
+        updated = self.store.update_work_item(
+            task_id, state=next_state.value, summary=summary.strip(), evidence=evidence
+        )
+        self.store.publish_event("qa.ready", task_id, {"reviewer": task["reviewer_id"], "evidence_count": len(evidence)})
+        self.store.audit(actor, "submit", "task", task_id, "allowed", {"evidence_count": len(evidence)})
+        if task["reviewer_id"] == "founder":
+            self._request_approval(updated, requested_by="jarvis")
+        return self._task(task_id)
+
+    def review_task(self, task_id: str, actor: str, approve: bool, findings: str) -> dict[str, Any]:
+        task = self._task(task_id)
+        if actor != task["reviewer_id"]:
+            self.store.audit(actor, "review", "task", task_id, "denied", {"expected": task["reviewer_id"]})
+            raise GovernanceError(f"Independent review must be performed by '{task['reviewer_id']}'")
+        if actor == task["owner_id"]:
+            raise GovernanceError("No agent may certify its own work")
+        if task["state"] != TaskState.AWAITING_REVIEW.value:
+            raise GovernanceError("Task is not awaiting independent review")
+        if not findings.strip():
+            raise GovernanceError("Review findings are required")
+        if not approve:
+            updated = self.store.update_work_item(
+                task_id,
+                state=TaskState.ASSIGNED.value,
+                summary=f"REVIEW REJECTED: {findings.strip()}\n\nPrevious submission: {task['summary']}",
+            )
+            self.store.publish_event("qa.rejected", task_id, {"reviewer": actor, "findings": findings})
+            self.store.audit(actor, "review", "task", task_id, "rejected", {"findings": findings})
+            return updated
+
+        gate = self.policy.completion_gate(task)
+        self.policy.require_allowed(gate)
+        self.store.publish_event("qa.approved", task_id, {"reviewer": actor, "findings": findings})
+        self.store.audit(actor, "review", "task", task_id, "approved", {"findings": findings})
+        if gate.requires_approval:
+            updated = self.store.update_work_item(task_id, state=TaskState.AWAITING_APPROVAL.value)
+            self._request_approval(updated, requested_by="jarvis")
+            return self._task(task_id)
+        return self._complete_task(task_id)
+
+    def _request_approval(self, task: dict[str, Any], requested_by: str) -> dict[str, Any]:
+        existing = [a for a in self.store.list_approvals("pending") if a["task_id"] == task["id"]]
+        if existing:
+            return existing[0]
+        approval = self.store.create_approval({
+            "id": _id("approval"),
+            "task_id": task["id"],
+            "action_type": task["action_type"],
+            "risk": task["risk"],
+            "requested_by": requested_by,
+            "payload": {
+                "title": task["title"], "summary": task["summary"], "evidence": task["evidence"],
+                "budget_cents": task["budget_cents"], "spent_cents": task["spent_cents"],
+            },
+        })
+        self.store.publish_event("approval.requested", approval["id"], {"task_id": task["id"], "risk": task["risk"]})
+        return approval
+
+    def decide_approval(self, approval_id: str, actor: str, decision: str, reason: str) -> dict[str, Any]:
+        if actor != self.founder_id:
+            raise GovernanceError("Only the founder may decide company approval requests")
+        try:
+            status = ApprovalStatus(decision)
+        except ValueError as exc:
+            raise GovernanceError(f"Invalid approval decision: {decision}") from exc
+        if status is ApprovalStatus.PENDING:
+            raise GovernanceError("A decision may not remain pending")
+        if not reason.strip():
+            raise GovernanceError("Founder decision reason is required")
+        approval = self.store.resolve_approval(approval_id, status.value, actor, reason.strip())
+        task_id = approval["task_id"]
+        if status is ApprovalStatus.APPROVED:
+            task = self._complete_task(task_id)
+        elif status in {ApprovalStatus.REJECTED, ApprovalStatus.CHANGES_REQUESTED}:
+            task = self.store.update_work_item(task_id, state=TaskState.BLOCKED.value)
+        else:
+            task = self.store.update_work_item(task_id, state=TaskState.AWAITING_APPROVAL.value)
+        self.store.publish_event(
+            f"approval.{status.value}", approval_id, {"task_id": task_id, "reason": reason, "actor": actor}
+        )
+        self.store.audit(actor, "decide_approval", "approval", approval_id, status.value, {"reason": reason})
+        return {"approval": approval, "task": task}
+
+    def record_cost(
+        self,
+        task_id: str,
+        agent_id: str,
+        amount_cents: int,
+        category: str,
+        units: float = 0,
+        unit_name: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        task = self._task(task_id)
+        if agent_id != task["owner_id"]:
+            raise GovernanceError("Cost owner must match the assigned employee")
+        if amount_cents < 0 or task["spent_cents"] + amount_cents > task["budget_cents"]:
+            self.store.audit(agent_id, "record_cost", "task", task_id, "denied", {"amount_cents": amount_cents})
+            raise GovernanceError("Cost would exceed the task budget")
+        self.store.record_cost({
+            "id": _id("cost"), "task_id": task_id, "agent_id": agent_id, "category": category,
+            "amount_cents": amount_cents, "units": units, "unit_name": unit_name, "metadata": metadata or {},
+        })
+        self.store.publish_event("cost.recorded", task_id, {"agent_id": agent_id, "amount_cents": amount_cents, "category": category})
+        return self._task(task_id)
+
+    def pause_agent(self, agent_id: str, reason: str, actor: str = "jarvis") -> dict[str, Any]:
+        """Immediately stop an employee and block any work currently in progress."""
+        if actor not in {"jarvis", self.founder_id}:
+            raise GovernanceError("Only JARVIS or the founder may pause an employee")
+        if agent_id == "jarvis":
+            raise GovernanceError("JARVIS can only be stopped through the founder's manual shutdown procedure")
+        if agent_id not in AGENTS_BY_ID:
+            raise GovernanceError(f"Unknown Amaura agent: {agent_id}")
+        if not reason.strip():
+            raise GovernanceError("A pause reason is required")
+        agent = self.store.set_agent_enabled(agent_id, False)
+        for task in self.list_tasks(owner_id=agent_id):
+            if task["state"] == TaskState.IN_PROGRESS.value:
+                self.store.update_work_item(
+                    task["id"], state=TaskState.BLOCKED.value,
+                    summary=f"PAUSED BY {actor.upper()}: {reason.strip()}\n\n{task['summary']}",
+                )
+                self.store.publish_event("task.blocked", task["id"], {"reason": "employee_paused", "agent_id": agent_id})
+        self.store.publish_event("agent.paused", agent_id, {"reason": reason, "actor": actor})
+        self.store.audit(actor, "pause_agent", "agent", agent_id, "allowed", {"reason": reason})
+        return agent
+
+    def resume_agent(self, agent_id: str, reason: str, actor: str) -> dict[str, Any]:
+        """Restore a paused employee using founder authority."""
+        if actor != self.founder_id:
+            raise GovernanceError("Only the founder may resume a paused employee")
+        if not reason.strip():
+            raise GovernanceError("A resume reason is required")
+        agent = self.store.set_agent_enabled(agent_id, True)
+        self.store.publish_event("agent.resumed", agent_id, {"reason": reason, "actor": actor})
+        self.store.audit(actor, "resume_agent", "agent", agent_id, "allowed", {"reason": reason})
+        return agent
+
+    def record_decision(
+        self,
+        *,
+        decision: str,
+        context: str,
+        options: list[str],
+        chosen_option: str,
+        reason: str,
+        actor: str,
+        review_date: str | None = None,
+    ) -> str:
+        if actor not in {"jarvis", self.founder_id}:
+            raise GovernanceError("Only JARVIS or the founder may record institutional decisions")
+        if chosen_option not in options:
+            raise GovernanceError("Chosen option must appear in the options considered")
+        decision_id = _id("decision")
+        self.store.record_decision({
+            "id": decision_id, "decision": decision, "context": context, "options": options,
+            "chosen_option": chosen_option, "reason": reason, "owner": actor, "review_date": review_date,
+        })
+        self.store.publish_event("decision.recorded", decision_id, {"decision": decision, "owner": actor})
+        self.store.audit(actor, "record_decision", "decision", decision_id, "allowed")
+        return decision_id
+
+    def dashboard(self) -> dict[str, Any]:
+        dashboard = self.store.dashboard()
+        dashboard["acquisition"] = self.acquisition.dashboard()
+        dashboard["founder"] = self.founder_name
+        dashboard["doctrine"] = {
+            "master": "JARVIS",
+            "independent_review": True,
+            "evidence_required": True,
+            "external_commitments_require_approval": True,
+        }
+        return dashboard
+
+    def production_readiness(self) -> dict[str, Any]:
+        from jarvis.amaura.readiness import production_readiness
+        return production_readiness(self)
+
+    def daily_briefing(self) -> dict[str, Any]:
+        tasks = self.store.list_work_items(item_type="task", limit=500)
+        pending = self.store.list_approvals(ApprovalStatus.PENDING.value)
+        now = datetime.now(UTC)
+        terminal = {TaskState.COMPLETED.value, TaskState.CANCELLED.value, TaskState.FAILED.value}
+        blocked = [task for task in tasks if task["state"] == TaskState.BLOCKED.value]
+        completed = [task for task in tasks if task["state"] == TaskState.COMPLETED.value]
+        failed = [task for task in tasks if task["state"] == TaskState.FAILED.value]
+        stalled = []
+        overdue = []
+        for task in tasks:
+            if task["state"] in terminal:
+                continue
+            try:
+                updated = datetime.fromisoformat(task["updated_at"])
+                if (now - updated).total_seconds() >= 86_400:
+                    stalled.append(task)
+            except (TypeError, ValueError):
+                pass
+            if task.get("deadline"):
+                try:
+                    deadline = datetime.fromisoformat(task["deadline"].replace("Z", "+00:00"))
+                    if deadline.tzinfo is None:
+                        deadline = deadline.replace(tzinfo=UTC)
+                    if deadline < now:
+                        overdue.append(task)
+                except (TypeError, ValueError):
+                    pass
+        budget_alerts = [
+            task for task in tasks
+            if task["budget_cents"] and task["spent_cents"] / task["budget_cents"] >= 0.8
+            and task["state"] not in terminal
+        ]
+        costs = sum(task["spent_cents"] for task in tasks)
+        founder_decisions = [
+            {
+                "approval_id": item["id"], "task_id": item["task_id"],
+                "title": item["payload"].get("title", "Decision required"), "risk": item["risk"],
+                "action_type": item["action_type"],
+            }
+            for item in pending[:3]
+        ]
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "company_status": self.dashboard(),
+            "revenue_opportunities": len([
+                task for task in tasks if task["owner_id"] == "opportunity_scout" and task["state"] != TaskState.CANCELLED.value
+            ]),
+            "client_actions_requiring_approval": len([
+                item for item in pending if item["action_type"] in {"external_proposal", "client_commitment", "contract_acceptance"}
+            ]),
+            "projects_completed": len(completed),
+            "projects_blocked": len(blocked),
+            "stalled_tasks": [{"id": task["id"], "title": task["title"], "owner_id": task["owner_id"]} for task in stalled],
+            "overdue_tasks": [{"id": task["id"], "title": task["title"], "deadline": task["deadline"]} for task in overdue],
+            "budget_alerts": [{"id": task["id"], "title": task["title"], "spent_cents": task["spent_cents"], "budget_cents": task["budget_cents"]} for task in budget_alerts],
+            "engineering_failures": len([t for t in failed if get_agent(t["owner_id"]).department == "product_engineering"]),
+            "research_results": len([t for t in completed if get_agent(t["owner_id"]).department == "ai_research"]),
+            "content_ready": len([t for t in tasks if t["action_type"] == "public_publish" and t["state"] == TaskState.AWAITING_APPROVAL.value]),
+            "costs_incurred_cents": costs,
+            "critical_risks": len([t for t in tasks if t["risk"] == RiskLevel.CRITICAL.value and t["state"] not in {TaskState.COMPLETED.value, TaskState.CANCELLED.value}]),
+            "top_founder_decisions": founder_decisions,
+        }
+
+    def list_tasks(self, state: str | None = None, owner_id: str | None = None) -> list[dict[str, Any]]:
+        return self.store.list_work_items(item_type="task", state=state, owner_id=owner_id)
+
+    def _task(self, task_id: str) -> dict[str, Any]:
+        task = self.store.get_work_item(task_id)
+        if task["item_type"] != "task":
+            raise GovernanceError(f"Work item '{task_id}' is not a task")
+        return task
+
+    def _ensure_agent_enabled(self, agent_id: str) -> None:
+        if not self.store.get_agent(agent_id)["enabled"]:
+            raise GovernanceError(f"Employee '{agent_id}' is paused and may not receive or execute work")
+
+    def _complete_task(self, task_id: str) -> dict[str, Any]:
+        task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
+        event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"
+        self.store.publish_event(event, task_id, {"owner": task["owner_id"], "evidence": len(task["evidence"])})
+        self._roll_up(task["parent_id"])
+        return task
+
+    def _roll_up(self, parent_id: str | None) -> None:
+        while parent_id:
+            parent = self.store.get_work_item(parent_id)
+            children = self.store.list_work_items(parent_id=parent_id, limit=500)
+            if children and all(child["state"] == TaskState.COMPLETED.value for child in children):
+                self.store.update_work_item(parent_id, state=TaskState.COMPLETED.value)
+                self.store.publish_event(f"{parent['item_type']}.completed", parent_id, {"children": len(children)})
+                parent_id = parent["parent_id"]
+            else:
+                break

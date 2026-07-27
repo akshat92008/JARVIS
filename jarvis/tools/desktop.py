@@ -3,10 +3,8 @@ Desktop Tools — macOS system control via AppleScript and shell commands.
 Gives Jarvis the ability to control the Mac like Iron Man controls his lab.
 """
 
-import os
 import subprocess
 import platform
-import json
 from pathlib import Path
 
 
@@ -178,27 +176,67 @@ def _run_applescript(script: str) -> str:
         return f"❌ Error: {e}"
 
 
+APP_ALIASES = {
+    "chrome": "Google Chrome",
+    "google chrome": "Google Chrome",
+    "vscode": "Visual Studio Code",
+    "code": "Visual Studio Code",
+    "visual studio code": "Visual Studio Code",
+    "safari": "Safari",
+    "finder": "Finder",
+    "terminal": "Terminal",
+    "iterm": "iTerm",
+    "iterm2": "iTerm",
+    "spotify": "Spotify",
+    "music": "Music",
+    "apple music": "Music",
+    "calculator": "Calculator",
+    "notes": "Notes",
+    "apple notes": "Notes",
+    "settings": "System Settings",
+    "system settings": "System Settings",
+    "preferences": "System Settings",
+    "calendar": "Calendar",
+    "mail": "Mail",
+    "apple mail": "Mail",
+    "slack": "Slack",
+    "discord": "Discord",
+    "telegram": "Telegram",
+    "photos": "Photos",
+    "messages": "Messages",
+    "textedit": "TextEdit",
+}
+
+
+def _resolve_app_name(name: str) -> str:
+    """Resolve an application alias or name to actual macOS app name."""
+    clean = name.strip().lower()
+    return APP_ALIASES.get(clean, name.strip())
+
+
 def tool_open_app(name: str) -> str:
     """Open a macOS application."""
-    result = _run_applescript(f'tell application "{name}" to activate')
+    app_name = _resolve_app_name(name)
+    result = _run_applescript(f'tell application "{app_name}" to activate')
     if result.startswith("❌"):
         return result
-    return f"✅ Opened {name}"
+    return f"✅ Opened {app_name}"
 
 
 def tool_close_app(name: str) -> str:
     """Close a macOS application."""
-    result = _run_applescript(f'tell application "{name}" to quit')
+    app_name = _resolve_app_name(name)
+    result = _run_applescript(f'tell application "{app_name}" to quit')
     if result.startswith("❌"):
         return result
-    return f"✅ Closed {name}"
+    return f"✅ Closed {app_name}"
 
 
 def tool_set_volume(level: int) -> str:
     """Set system volume (0-100)."""
     level = max(0, min(100, level))
     # macOS volume is 0-7 in osascript, but we can use 0-100 directly
-    osascript_level = int(level * 7 / 100)
+    int(level * 7 / 100)
     _run_applescript(f"set volume output volume {level}")
     return f"✅ Volume set to {level}%"
 
@@ -230,7 +268,7 @@ def tool_get_system_info() -> str:
         # Parse page size and free pages
         lines = mem.stdout.strip().split("\n")
         if len(lines) > 1:
-            info.append(f"🧠 Memory (from vm_stat):")
+            info.append("🧠 Memory (from vm_stat):")
             for line in lines[1:4]:
                 info.append(f"   {line.strip()}")
     except Exception:
@@ -309,7 +347,7 @@ def tool_set_brightness(level: float) -> str:
         if result.returncode == 0:
             return f"✅ Brightness set to {int(level * 100)}%"
         # Fallback: AppleScript (limited support)
-        return f"⚠️ brightness command not found. Install with: brew install brightness"
+        return "⚠️ brightness command not found. Install with: brew install brightness"
     except Exception as e:
         return f"❌ Brightness error: {e}"
 

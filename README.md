@@ -4,6 +4,14 @@
 A full-fledged personal AI assistant inspired by Iron Man's J.A.R.V.I.S. — powered by NVIDIA's free API.
 Control your Mac with voice, generate documents, research the web, write code, and manage your digital life from the terminal or your phone via Telegram.
 
+## 🏢 Amaura Studio Company OS
+
+JARVIS is also the master control plane for Amaura Studio's governed 15-role AI workforce. It converts founder objectives into programmes, assigns narrow specialist tasks, enforces tool/data/cost authority, requires independent review, and routes sensitive actions to founder approval. The system includes durable tasks, events, audit history, policies, model routing, workflows, dashboards, Telegram approvals, and daily briefings.
+
+See [docs/AMAURA_STUDIO.md](docs/AMAURA_STUDIO.md) for the operating model, configuration, workflows, and API.
+
+The production expansion includes a 43-employee registry, a 16-stage evidence-governed client-acquisition pipeline, a 12-stage content factory, the founder-approved revenue prompt catalogue, idempotent and approval-gated outbound actions, licence and analytics tracking, prompt-injection controls, kill switches, portable storage, stress tests, and deployable REST surfaces. See [docs/AMAURA_PRODUCTION.md](docs/AMAURA_PRODUCTION.md) for secure configuration, endpoints, verification, and operations.
+
 ---
 
 ## ⚡ Quick Start

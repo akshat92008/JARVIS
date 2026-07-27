@@ -1,0 +1,388 @@
+"""The governed Amaura Studio v1 workforce registry."""
+
+from __future__ import annotations
+
+from jarvis.amaura.models import CompanyAgent, RiskLevel
+from jarvis.amaura.prompts import PROMPT_VERSION, get_system_prompt
+
+
+DOCTRINE = (
+    "You are an Amaura Labs AI employee. JARVIS is your sole company orchestrator. "
+    "Work only from a structured task packet, use only approved tools and data, stay "
+    "within budget, attach verifiable evidence, never certify your own work, never "
+    "invent facts, and escalate any action outside your authority."
+)
+
+
+def _agent(
+    agent_id: str,
+    name: str,
+    department: str,
+    objective: str,
+    tools: tuple[str, ...],
+    permissions: tuple[str, ...],
+    data_access: tuple[str, ...],
+    cost: int,
+    risk: RiskLevel,
+    reviewer: str | None,
+    metrics: tuple[str, ...],
+    prompt_profile: str | None = None,
+) -> CompanyAgent:
+    fallback = f"{DOCTRINE}\n\nROLE: {name}\nOBJECTIVE: {objective}"
+    role_prompt = get_system_prompt(prompt_profile, fallback) if prompt_profile else fallback
+    return CompanyAgent(
+        agent_id=agent_id,
+        name=name,
+        department=department,
+        objective=objective,
+        tools=tools,
+        permissions=permissions,
+        data_access=data_access,
+        cost_limit_cents=cost,
+        max_risk=risk,
+        reviewer_id=reviewer,
+        performance_objectives=metrics,
+        system_prompt=(
+            f"{DOCTRINE}\n\nPROMPT VERSION: {PROMPT_VERSION}\n\n{role_prompt}"
+            if prompt_profile else role_prompt
+        ),
+    )
+
+
+V1_AGENTS: tuple[CompanyAgent, ...] = (
+    _agent(
+        "jarvis", "JARVIS", "control_plane",
+        "Translate founder direction into measurable programmes and govern every agent.",
+        ("amaura_create_program", "amaura_company_status", "amaura_task_packet", "amaura_daily_briefing"),
+        ("plan", "delegate", "pause", "escalate", "request_approval"),
+        ("company", "products", "clients", "research", "marketing", "decisions", "costs"),
+        5000, RiskLevel.HIGH, "founder",
+        ("programme outcome rate", "blocked-task age", "budget variance", "founder decision latency"),
+    ),
+    _agent(
+        "opportunity_scout", "Opportunity Scout", "revenue",
+        "Discover evidence-backed commercial opportunities from approved sources.",
+        ("web_search", "web_fetch", "read_file"), ("research", "draft"),
+        ("public", "approved_lead_sources"), 300, RiskLevel.LOW, "lead_qualification",
+        ("qualified opportunities", "source coverage", "false-positive rate"),
+    ),
+    _agent(
+        "lead_qualification", "Lead Qualification Agent", "revenue",
+        "Reject poor-fit work and rank viable leads by value, risk, and strategic relevance.",
+        ("read_file", "vector_search"), ("analyse", "recommend"),
+        ("leads", "pricing_policy", "client_history"), 250, RiskLevel.LOW, "jarvis",
+        ("accepted-lead win rate", "bad-fit rejection rate"),
+    ),
+    _agent(
+        "proposal", "Proposal Agent", "revenue",
+        "Draft specific proposals grounded in verified requirements and approved pricing policy.",
+        ("read_file", "create_document"), ("draft",),
+        ("qualified_leads", "proposal_templates", "pricing_policy"), 400, RiskLevel.MEDIUM, "jarvis",
+        ("proposal acceptance rate", "unsupported-claim rate"),
+    ),
+    _agent(
+        "crm", "CRM Agent", "revenue",
+        "Maintain lead state, communications, value, probability, follow-up, and next action.",
+        ("read_file", "write_file"), ("read_crm", "update_crm"),
+        ("leads", "client_communications"), 150, RiskLevel.LOW, "jarvis",
+        ("record completeness", "overdue follow-ups"),
+    ),
+    _agent(
+        "client_communication", "Client Communication Agent", "revenue",
+        "Draft accurate client replies and updates without making unapproved commitments.",
+        ("read_file", "create_document"), ("draft_external",),
+        ("client_requirements", "client_communications", "project_status"), 300, RiskLevel.MEDIUM, "jarvis",
+        ("draft approval rate", "commitment violations"),
+    ),
+    _agent(
+        "product_manager", "Product Manager", "product_engineering",
+        "Turn validated needs into requirements, acceptance criteria, milestones, and releases.",
+        ("read_file", "search_code", "get_project_structure"), ("plan", "define_acceptance_criteria"),
+        ("products", "user_evidence", "roadmap"), 400, RiskLevel.LOW, "technical_architect",
+        ("acceptance-criteria pass rate", "scope change rate"),
+    ),
+    _agent(
+        "technical_architect", "Technical Architect", "product_engineering",
+        "Define secure, maintainable architecture, boundaries, data design, and rollback strategy.",
+        ("read_file", "search_code", "get_project_structure", "analyze_code"),
+        ("analyse_repo", "author_adr", "recommend"), ("repositories", "products", "security_policy"),
+        500, RiskLevel.LOW, "qa", ("architecture defects", "decision reversals"),
+    ),
+    _agent(
+        "repository_intelligence", "Repository Intelligence Agent", "product_engineering",
+        "Select only relevant repository context and maintain symbol and dependency maps.",
+        ("read_file", "search_code", "find_files", "get_project_structure", "index_repository", "query_symbols"),
+        ("read_repo", "index_repo"), ("repositories",), 300, RiskLevel.LOW, "technical_architect",
+        ("context precision", "wrong-file rate", "context token savings"),
+    ),
+    _agent(
+        "builder", "Builder Agent", "product_engineering",
+        "Implement approved plans in isolated workspaces without self-certification.",
+        ("read_file", "search_code", "write_file", "run_command", "run_tests"),
+        ("read_repo", "write_branch", "run_safe_commands"), ("assigned_repository", "approved_plan"),
+        1200, RiskLevel.MEDIUM, "qa", ("first-pass QA rate", "regression rate", "cost per accepted task"),
+    ),
+    _agent(
+        "patch_engineer", "Patch Engineer", "product_engineering",
+        "Apply exact, pre-approved transformations and report the expected post-edit state.",
+        ("read_file", "edit_file", "diff_files"), ("read_repo", "write_exact_patch"),
+        ("approved_plan", "target_files"), 500, RiskLevel.MEDIUM, "qa",
+        ("patch application rate", "wrong-file rate", "format compliance"),
+    ),
+    _agent(
+        "qa", "QA Agent", "product_engineering",
+        "Independently verify acceptance criteria, regressions, security, and evidence.",
+        ("read_file", "search_code", "run_tests", "lint_code", "analyze_code", "git_diff"),
+        ("read_repo", "run_safe_commands", "approve_or_reject"), ("repositories", "test_evidence", "policies"),
+        700, RiskLevel.LOW, "jarvis", ("escaped defects", "false approvals", "verification coverage"),
+    ),
+    _agent(
+        "content_strategy", "Content Strategy Agent", "growth_media",
+        "Turn verified company events into focused content opportunities and editorial plans.",
+        ("read_file", "web_search"), ("research", "plan", "draft"),
+        ("verified_company_events", "brand_policy", "marketing_metrics"), 300, RiskLevel.LOW, "jarvis",
+        ("business-qualified content ideas", "evidence coverage"),
+    ),
+    _agent(
+        "content_production", "Content Production Agent", "growth_media",
+        "Create platform-ready assets from verified master sources without inventing achievements.",
+        ("read_file", "create_document", "create_presentation"), ("draft_public",),
+        ("approved_content_brief", "verified_evidence", "brand_policy"), 500, RiskLevel.MEDIUM, "jarvis",
+        ("approval rate", "claim correction rate", "attributed outcomes"),
+    ),
+    _agent(
+        "research_evaluation", "Research and Evaluation Agent", "ai_research",
+        "Run hypothesis-led, reproducible research and independently report regressions and costs.",
+        ("web_search", "web_fetch", "read_pdf", "read_file", "run_command", "run_tests"),
+        ("research", "run_sandboxed_experiment", "evaluate"),
+        ("research", "datasets", "models", "experiment_registry"), 1500, RiskLevel.MEDIUM, "qa",
+        ("reproducible experiments", "regressions detected", "cost per accepted improvement"),
+    ),
+)
+
+
+REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
+    _agent(
+        "revenue_orchestrator", "Revenue Workforce Orchestrator", "revenue",
+        "Run an ethical, measurable loop from one campaign through won-project handoff.",
+        ("read_file", "web_search", "amaura_company_status", "amaura_list_tasks"),
+        ("plan", "delegate", "recommend", "request_approval"),
+        ("campaigns", "leads", "evidence", "messages", "pipeline_metrics", "portfolio"),
+        600, RiskLevel.MEDIUM, "jarvis",
+        ("qualified pipeline value", "positive reply rate", "sales-cycle length", "won revenue"),
+        "revenue_orchestrator",
+    ),
+    _agent(
+        "chief_revenue_officer", "Chief Revenue Officer", "revenue",
+        "Create predictable, profitable project revenue without compromising Amaura's reputation.",
+        ("read_file", "vector_search", "amaura_company_status", "amaura_list_tasks"),
+        ("analyse", "prioritise", "recommend_pricing", "request_approval"),
+        ("campaigns", "leads", "proposals", "pricing_policy", "portfolio", "revenue_metrics"),
+        700, RiskLevel.MEDIUM, "jarvis",
+        ("qualified reply rate", "proposal conversion", "average project value", "recurring revenue"),
+        "chief_revenue_officer",
+    ),
+    _agent(
+        "campaign_manager", "Campaign Manager", "revenue",
+        "Configure one bounded offer, segment, region, proof set, and daily operating envelope.",
+        ("read_file", "vector_search"), ("plan", "configure_campaign"),
+        ("campaigns", "portfolio", "pricing_policy"), 200, RiskLevel.LOW, "chief_revenue_officer",
+        ("campaign completeness", "target precision", "limit compliance"),
+    ),
+    _agent(
+        "lead_scout", "Lead Scout", "revenue",
+        "Discover public, campaign-fit businesses without restricted scraping or guessed contact data.",
+        ("web_search", "web_fetch", "read_file"), ("research", "draft"),
+        ("public", "campaigns", "lead_domains"), 250, RiskLevel.LOW, "prospect_research",
+        ("unique qualified discoveries", "duplicate rate", "source coverage"),
+        "lead_discovery_outreach",
+    ),
+    _agent(
+        "prospect_research", "Prospect Research Analyst", "revenue",
+        "Extract source-linked business evidence from the minimum necessary public pages.",
+        ("web_fetch", "read_file"), ("research", "extract"),
+        ("public", "campaigns", "leads"), 250, RiskLevel.LOW, "compliance_reviewer",
+        ("evidence completeness", "claim precision", "pages per lead"),
+    ),
+    _agent(
+        "contact_resolver", "Contact Resolver", "revenue",
+        "Locate verifiable public business contact routes and never infer private addresses.",
+        ("web_fetch", "read_file"), ("research", "recommend"),
+        ("public", "leads"), 150, RiskLevel.LOW, "compliance_reviewer",
+        ("verified contact rate", "guessed-address rate"),
+    ),
+    _agent(
+        "portfolio_matcher", "Portfolio Matcher", "revenue",
+        "Select at most two genuinely relevant Amaura proof assets for each prospect.",
+        ("read_file", "vector_search"), ("analyse", "recommend"),
+        ("leads", "portfolio", "verified_evidence"), 100, RiskLevel.LOW, "opportunity_analyst",
+        ("proof relevance", "unsupported proof rate"),
+    ),
+    _agent(
+        "opportunity_analyst", "Opportunity Analyst", "revenue",
+        "Turn verified evidence into one specific, non-invented commercial opportunity.",
+        ("read_file", "vector_search"), ("analyse", "recommend"),
+        ("leads", "evidence", "portfolio"), 180, RiskLevel.LOW, "compliance_reviewer",
+        ("observation acceptance", "unsupported-claim rate"),
+    ),
+    _agent(
+        "outreach_writer", "Outreach Writer", "revenue",
+        "Prepare concise, personalised, proof-based outreach for human approval.",
+        ("read_file", "create_document"), ("draft_external",),
+        ("qualified_leads", "evidence", "portfolio", "brand_policy"), 250, RiskLevel.MEDIUM,
+        "compliance_reviewer", ("approval rate", "qualified reply rate", "rewrite rate"),
+        "lead_discovery_outreach",
+    ),
+    _agent(
+        "compliance_reviewer", "Revenue Compliance and Quality Reviewer", "revenue",
+        "Reject unsupported claims, spam, irrelevant proof, opt-out violations, and duplicate contact.",
+        ("read_file", "vector_search"), ("analyse", "approve_or_reject"),
+        ("leads", "evidence", "messages", "policies"), 180, RiskLevel.LOW, "jarvis",
+        ("false approvals", "policy escape rate", "review precision"),
+    ),
+    _agent(
+        "approval_coordinator", "Human Approval Coordinator", "control_plane",
+        "Present complete approval cards and execute only the founder's authenticated decision.",
+        ("read_file",), ("request_approval", "create_draft_after_approval"),
+        ("qualified_leads", "evidence", "messages", "approvals"), 100, RiskLevel.HIGH, "founder",
+        ("approval packet completeness", "stale approval rate", "unauthorised action rate"),
+    ),
+    _agent(
+        "sales_closer", "Senior Sales Closer", "revenue",
+        "Convert qualified replies into profitable, bounded paid milestones and retainers.",
+        ("read_file", "create_document", "vector_search"), ("analyse", "draft_external", "recommend_pricing"),
+        ("qualified_leads", "communications", "portfolio", "pricing_policy"), 450, RiskLevel.MEDIUM, "jarvis",
+        ("close rate", "advance-payment rate", "scope defects", "recurring revenue"),
+        "sales_closer",
+    ),
+    _agent(
+        "followup", "Follow-up Agent", "revenue",
+        "Prepare at most two relevant follow-ups and stop immediately on rejection or opt-out.",
+        ("read_file", "create_document"), ("draft_external",),
+        ("messages", "leads", "evidence"), 120, RiskLevel.MEDIUM, "compliance_reviewer",
+        ("follow-up reply rate", "limit compliance", "opt-out compliance"),
+    ),
+    _agent(
+        "reply_intelligence", "Reply Intelligence Agent", "revenue",
+        "Classify lead replies, extract needs, and prepare grounded next actions without commitments.",
+        ("read_file", "vector_search"), ("analyse", "draft_external"),
+        ("lead_threads", "leads", "pricing_policy"), 180, RiskLevel.MEDIUM, "sales_closer",
+        ("classification accuracy", "commitment violations", "response latency"),
+    ),
+    _agent(
+        "discovery", "Discovery and Meeting Agent", "revenue",
+        "Prepare evidence-backed meeting briefs and turn founder notes into bounded requirements.",
+        ("read_file", "create_document", "vector_search"), ("analyse", "draft"),
+        ("leads", "evidence", "communications", "portfolio"), 220, RiskLevel.LOW, "sales_closer",
+        ("brief completeness", "unresolved-risk capture", "next-action clarity"),
+    ),
+    _agent(
+        "project_handoff", "Won Project Handoff Agent", "delivery",
+        "Create a complete, least-privilege delivery packet after approved commercial acceptance.",
+        ("read_file", "write_file", "create_document"), ("draft", "create_delivery_packet"),
+        ("won_leads", "approved_proposals", "client_requirements"), 300, RiskLevel.MEDIUM, "product_manager",
+        ("handoff completeness", "delivery clarification rate", "credential exposure rate"),
+    ),
+)
+
+
+CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
+    _agent(
+        "marketing_head", "Head of Marketing and Demand Generation", "growth_media",
+        "Turn verified Amaura work into qualified interest, authority, and commercial conversations.",
+        ("read_file", "web_search", "create_document"), ("plan", "draft_public"),
+        ("verified_company_events", "portfolio", "brand_policy", "marketing_metrics"), 400,
+        RiskLevel.MEDIUM, "jarvis", ("qualified enquiries", "portfolio clicks", "influenced revenue"),
+        "marketing_demand_generation",
+    ),
+    _agent(
+        "content_research", "Trend and Content Research Employee", "growth_media",
+        "Find audience questions, demand, credible sources, content gaps, and Amaura's unique angle.",
+        ("web_search", "web_fetch", "read_file"), ("research", "draft"),
+        ("public", "verified_company_events", "portfolio"), 250, RiskLevel.LOW, "content_strategy",
+        ("source quality", "content-gap precision", "business relevance"),
+    ),
+    _agent(
+        "scriptwriter", "Scriptwriting Employee", "growth_media",
+        "Create factual long-form scripts, scene plans, claims, demonstrations, hooks, and metadata.",
+        ("read_file", "create_document"), ("draft_public",),
+        ("approved_content_brief", "verified_evidence", "brand_policy"), 350, RiskLevel.MEDIUM,
+        "media_qa", ("claim accuracy", "script approval rate", "repurposing yield"),
+    ),
+    _agent(
+        "demo_operator", "Product Demo Employee", "growth_media",
+        "Record reproducible product demonstrations with secrets and private data excluded.",
+        ("read_file", "run_command"), ("run_safe_commands", "record_demo"),
+        ("approved_demo_plan", "assigned_product"), 250, RiskLevel.MEDIUM, "media_qa",
+        ("demo success rate", "retake rate", "secret exposure rate"),
+    ),
+    _agent(
+        "voice_production", "Voice Production Employee", "growth_media",
+        "Produce consistent, licensed narration without impersonation or unauthorised voice cloning.",
+        ("read_file", "run_command"), ("run_safe_commands", "render_audio"),
+        ("approved_script", "pronunciation_dictionary"), 200, RiskLevel.LOW, "media_qa",
+        ("pronunciation accuracy", "audio defects", "licence compliance"),
+    ),
+    _agent(
+        "asset_curator", "Media Asset and Licence Employee", "growth_media",
+        "Collect only owned or licensed visuals with source, creator, terms, and retrieval evidence.",
+        ("web_search", "web_fetch", "read_file"), ("research", "download_approved_assets"),
+        ("approved_asset_sources", "brand_policy", "content_campaigns"), 250, RiskLevel.LOW, "media_qa",
+        ("licence completeness", "asset relevance", "attribution defects"),
+    ),
+    _agent(
+        "video_production", "Video Production Employee", "growth_media",
+        "Assemble approved recordings, narration, assets, captions, and templates into validated renders.",
+        ("read_file", "run_command"), ("run_safe_commands", "render_media"),
+        ("approved_campaign_assets", "render_templates"), 600, RiskLevel.MEDIUM, "media_qa",
+        ("render success", "technical defect rate", "production time"),
+    ),
+    _agent(
+        "shorts_editor", "Short-form Repurposing Employee", "growth_media",
+        "Select standalone, high-value moments and create permission-safe vertical variants.",
+        ("read_file", "run_command"), ("run_safe_commands", "render_media"),
+        ("owned_long_form", "transcripts", "brand_policy"), 300, RiskLevel.MEDIUM, "media_qa",
+        ("accepted clips", "context rejection rate", "short retention"),
+    ),
+    _agent(
+        "thumbnail_metadata", "Thumbnail and Metadata Employee", "growth_media",
+        "Create readable, deterministic thumbnail variants, accurate titles, chapters, and descriptions.",
+        ("read_file", "create_document", "run_command"), ("draft_public", "render_media"),
+        ("approved_campaign_assets", "brand_policy", "verified_evidence"), 220, RiskLevel.MEDIUM,
+        "media_qa", ("mobile readability", "title accuracy", "click-through rate"),
+    ),
+    _agent(
+        "media_qa", "Media QA and Claims Employee", "growth_media",
+        "Independently verify facts, privacy, licences, audio/video integrity, captions, and calls to action.",
+        ("read_file", "run_command"), ("run_safe_commands", "approve_or_reject"),
+        ("campaign_assets", "verified_evidence", "licence_records", "policies"), 350, RiskLevel.LOW,
+        "jarvis", ("escaped claims", "privacy escapes", "technical defect escapes"),
+    ),
+    _agent(
+        "publishing", "Publishing and Scheduling Employee", "growth_media",
+        "Prepare private drafts and schedules; make nothing public without founder approval.",
+        ("read_file",), ("draft_public", "schedule_after_approval"),
+        ("approved_content", "platform_policy", "publication_calendar"), 180, RiskLevel.HIGH, "founder",
+        ("unauthorised publications", "metadata completeness", "schedule accuracy"),
+    ),
+    _agent(
+        "content_analytics", "Content Analytics and Learning Employee", "growth_media",
+        "Measure business and audience outcomes at 24h, 72h, 7d, and 30d and preserve evidence-backed lessons.",
+        ("read_file", "vector_search"), ("analyse", "recommend"),
+        ("platform_analytics", "content_campaigns", "revenue_attribution"), 200, RiskLevel.LOW,
+        "marketing_head", ("lesson evidence quality", "qualified enquiries", "influenced revenue"),
+    ),
+)
+
+
+ALL_AGENTS: tuple[CompanyAgent, ...] = V1_AGENTS + REVENUE_AGENTS + CONTENT_FACTORY_AGENTS
+
+AGENTS_BY_ID = {agent.agent_id: agent for agent in ALL_AGENTS}
+
+
+def get_agent(agent_id: str) -> CompanyAgent:
+    """Return a registered company agent or raise a clear error."""
+    try:
+        return AGENTS_BY_ID[agent_id]
+    except KeyError as exc:
+        raise KeyError(f"Unknown Amaura agent: {agent_id}") from exc

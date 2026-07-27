@@ -3,7 +3,6 @@ Communication Tools — iMessage, Reminders, and email integration via AppleScri
 """
 
 import subprocess
-from datetime import datetime
 
 
 # ── Tool Definitions ─────────────────────────────────────────────────────────
@@ -70,6 +69,14 @@ COMMUNICATION_TOOL_DEFINITIONS = [
 # ── Implementations ──────────────────────────────────────────────────────────
 
 def _run_applescript(script: str) -> str:
+    # Auto-launch target macOS app if needed to prevent AppleScript connection error (-609)
+    for app in ("Reminders", "Calendar", "Messages", "Mail"):
+        if f'tell application "{app}"' in script or f'tell application \\"{app}\\"' in script:
+            try:
+                subprocess.run(["open", "-a", app], timeout=3, capture_output=True)
+            except Exception:
+                pass
+
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
@@ -100,15 +107,25 @@ def tool_send_imessage(to: str, message: str) -> str:
 
 def tool_add_reminder(title: str, notes: str = "") -> str:
     """Add a reminder to Apple Reminders."""
-    escaped_title = title.replace('"', '\\"')
+    escaped_title = title.replace('"', '\\"').replace('\n', ' ')
     script = f'''
     tell application "Reminders"
-        tell list "Reminders"
-            make new reminder with properties {{name:"{escaped_title}"}}
-        end tell
+        launch
+        set targetList to default list
+        make new reminder at targetList with properties {{name:"{escaped_title}"}}
     end tell
     '''
     result = _run_applescript(script)
+    if result.startswith("❌"):
+        # Fallback if default list is undefined
+        fallback_script = f'''
+        tell application "Reminders"
+            launch
+            set targetList to first list
+            make new reminder at targetList with properties {{name:"{escaped_title}"}}
+        end tell
+        '''
+        result = _run_applescript(fallback_script)
     if result.startswith("❌"):
         return result
     return f"✅ Reminder added: {title}"
@@ -118,14 +135,27 @@ def tool_get_reminders() -> str:
     """Get current reminders."""
     script = '''
     tell application "Reminders"
+        launch
         set reminderList to {}
-        repeat with r in (reminders of list "Reminders" whose completed is false)
+        repeat with r in (reminders of default list whose completed is false)
             set end of reminderList to name of r
         end repeat
         return reminderList
     end tell
     '''
     result = _run_applescript(script)
+    if result.startswith("❌"):
+        fallback_script = '''
+        tell application "Reminders"
+            launch
+            set reminderList to {}
+            repeat with r in (reminders of first list whose completed is false)
+                set end of reminderList to name of r
+            end repeat
+            return reminderList
+        end tell
+        '''
+        result = _run_applescript(fallback_script)
     if result.startswith("❌"):
         return result
     if not result:

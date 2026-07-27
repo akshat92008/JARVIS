@@ -1,6 +1,7 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
+
 
 [project]
 name = "jarvis"
@@ -8,10 +9,15 @@ version = "1.0.0"
 description = "J.A.R.V.I.S. — Just A Rather Very Intelligent System. Personal AI assistant powered by NVIDIA."
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 
 [project.scripts]
 jarvis = "jarvis.cli:main"
+nexus = "jarvis.cli:main"
+
 
 [tool.setuptools.packages.find]
 include = ["jarvis*"]
+
+[tool.setuptools.package-data]
+"jarvis.amaura.prompts" = ["*.md"]

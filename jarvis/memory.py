@@ -4,12 +4,11 @@ Stored in ~/.jarvis/conversations/.
 """
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from jarvis.paths import get_data_dir
 
-MEMORY_DIR = Path.home() / ".jarvis" / "conversations"
+MEMORY_DIR = get_data_dir() / "conversations"
 
 
 class ConversationMemory:
@@ -94,9 +93,16 @@ class ConversationMemory:
         conv_id: str,
     ):
         """Auto-save the current conversation."""
-        if len(messages) < 2:
-            return
         self.save_conversation(messages, model_name, model_id, working_dir, conv_id)
+        try:
+            from jarvis.tools.vector_memory import remember_fact
+            for msg in messages[-4:]:
+                if msg.get("role") == "user" and msg.get("content"):
+                    content = msg["content"].strip()
+                    if len(content) > 15:
+                        remember_fact(f"Past query ({conv_id}): {content[:300]}", category="conversation", importance=3.0, source="conversation")
+        except Exception:
+            pass
 
 
 def _get_preview(messages: list[dict], max_len: int = 80) -> str:

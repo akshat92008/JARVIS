@@ -8,9 +8,10 @@ import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from jarvis.paths import get_data_dir
 
 
-PREFS_FILE = Path.home() / ".jarvis" / "personal.json"
+PREFS_FILE = get_data_dir() / "personal.json"
 
 
 @dataclass
@@ -55,7 +56,7 @@ class PersonalMemory:
         parts = []
 
         if self.name:
-            parts.append(f"[PERSONAL KNOWLEDGE — About the User]")
+            parts.append("[PERSONAL KNOWLEDGE — About the User]")
             parts.append(f"  Name: {self.name}")
             if self.nickname:
                 parts.append(f"  Preferred name: {self.nickname}")
@@ -144,6 +145,11 @@ class UserMemory:
             if len(prefs.facts) > 200:
                 prefs.facts = prefs.facts[-200:]
             self.save()
+            try:
+                from jarvis.tools.vector_memory import remember_fact
+                remember_fact(fact, category="preference", importance=8.0, source="personal_memory")
+            except Exception:
+                pass
 
     def add_convention(self, convention: str):
         """Add a work convention."""
@@ -153,6 +159,11 @@ class UserMemory:
             if len(prefs.work_conventions) > 50:
                 prefs.work_conventions = prefs.work_conventions[-50:]
             self.save()
+            try:
+                from jarvis.tools.vector_memory import remember_fact
+                remember_fact(convention, category="convention", importance=8.5, source="personal_memory")
+            except Exception:
+                pass
 
     def record_correction(self, lesson: str, context: str = ""):
         """Record something the user corrected."""
@@ -165,6 +176,12 @@ class UserMemory:
         if len(prefs.corrections) > 100:
             prefs.corrections = prefs.corrections[-100:]
         self.save()
+        try:
+            from jarvis.tools.vector_memory import remember_fact
+            corr_text = f"Correction: {lesson}. Context: {context}" if context else f"Correction: {lesson}"
+            remember_fact(corr_text, category="correction", importance=9.0, source="personal_memory")
+        except Exception:
+            pass
 
     def set_preference(self, key: str, value) -> bool:
         """Set a preference."""

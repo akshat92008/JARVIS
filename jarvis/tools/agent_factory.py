@@ -11,16 +11,15 @@ import os
 import re
 import json
 import uuid
-import subprocess
 from pathlib import Path
+from jarvis.paths import get_data_dir
 from datetime import datetime
-from textwrap import dedent
 from typing import Optional
 
 
 # ── Agent Storage ────────────────────────────────────────────────────────────
 
-AGENTS_DIR = Path.home() / ".jarvis" / "agents"
+AGENTS_DIR = get_data_dir() / "agents"
 AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -370,7 +369,7 @@ def tool_run_agent(agent_id: str, task: str, max_iterations: int = 20) -> str:
         f"# Agent Execution: {agent.name}",
         f"**Task:** {task}",
         f"**Model:** {agent.model}",
-        f"**Status:** Running...",
+        "**Status:** Running...",
         "",
     ]
 
@@ -498,7 +497,7 @@ def tool_agent_status(agent_id: str) -> str:
     if last_run_file.exists():
         try:
             last_run = json.loads(last_run_file.read_text(encoding="utf-8"))
-            lines.append(f"\n## Last Run")
+            lines.append("\n## Last Run")
             lines.append(f"**Task:** {last_run.get('task', '?')[:100]}")
             lines.append(f"**Time:** {last_run.get('timestamp', '?')}")
             lines.append(f"**Iterations:** {last_run.get('iterations', '?')}")
@@ -922,7 +921,7 @@ Be strategic about task delegation — use each agent's specialization effective
         lines.append(f"  - 🤖 {a.name} (ID: `{a.agent_id}`): {a.description}")
 
     lines.append(f"\n**To run:** Use `run_agent` with the Orchestrator ID `{orchestrator.agent_id}` and your task.")
-    lines.append(f"The orchestrator will automatically delegate to workers.")
+    lines.append("The orchestrator will automatically delegate to workers.")
 
     return "\n".join(lines)
 

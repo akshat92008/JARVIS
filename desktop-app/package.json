@@ -1,0 +1,39 @@
+{
+  "name": "jarvis-desktop",
+  "version": "2.0.0",
+  "description": "J.A.R.V.I.S. — Just A Rather Very Intelligent System — Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.jarvis.desktop",
+    "productName": "J.A.R.V.I.S.",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "target": ["dmg", "zip"],
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.plist",
+      "entitlementsInherit": "entitlements.plist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "node_modules/**/*"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0"
+  }
+}

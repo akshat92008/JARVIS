@@ -5,7 +5,6 @@ Gives Jarvis the ability to research topics autonomously.
 
 import os
 import re
-import json
 import html
 import urllib.request
 from pathlib import Path
@@ -134,7 +133,7 @@ def tool_deep_research(topic: str, num_queries: int = 3) -> str:
                         "snippet": r.get("body", ""),
                         "query": query,
                     })
-        except Exception as e:
+        except Exception:
             continue
 
     if not all_results:
@@ -183,13 +182,72 @@ def tool_summarize_url(url: str) -> str:
     return f"Content from {url}:\n\n{text}"
 
 
-def tool_read_pdf(path: str, max_pages: int | None = None) -> str:
-    """Extract text from a PDF file."""
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        return f"❌ PDF not found: {path}"
+def _find_candidate_pdfs(requested_path: str) -> list[tuple[Path, float]]:
+    """Find candidate PDF files matching the requested path query."""
+    clean_name = Path(requested_path).stem.lower()
+    keywords = [w for w in re.findall(r'\w+', clean_name) if w not in ('the', 'a', 'an', 'pdf')]
+    if not keywords:
+        keywords = [clean_name]
 
-    # Try pdftotext (poppler) first
+    search_dirs = [
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+        Path.home() / "Documents",
+        Path.cwd(),
+    ]
+
+    candidates = []
+    seen = set()
+
+    for sdir in search_dirs:
+        if not sdir.exists():
+            continue
+        try:
+            for root, dirs, files in os.walk(sdir):
+                rel_depth = len(Path(root).relative_to(sdir).parts)
+                if rel_depth > 2:
+                    dirs.clear()
+                    continue
+                for f in files:
+                    if f.lower().endswith(".pdf"):
+                        full_p = Path(root) / f
+                        if full_p in seen:
+                            continue
+                        seen.add(full_p)
+                        fname_lower = f.lower()
+                        fname_words = set(re.findall(r'\w+', fname_lower))
+                        
+                        matches = sum(1 for kw in keywords if kw in fname_lower or kw in fname_words)
+                        if matches > 0:
+                            score = matches / len(keywords)
+                            candidates.append((full_p, score))
+        except Exception:
+            pass
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates
+
+
+def tool_read_pdf(path: str, max_pages: int | None = None) -> str:
+    """Extract text from a PDF file with automatic fuzzy path resolution and multi-engine extraction."""
+    p = Path(path).expanduser().resolve()
+    resolved_note = ""
+
+    if not p.exists():
+        candidates = _find_candidate_pdfs(path)
+        if candidates and candidates[0][1] >= 0.3:
+            top_match = candidates[0][0]
+            resolved_note = f"ℹ️ Auto-resolved path to: {top_match}\n\n"
+            p = top_match
+        else:
+            cand_list = "\n".join([f"  • {c[0]}" for c in candidates[:5]])
+            if cand_list:
+                return f"❌ PDF not found at exact path: '{path}'\nDid you mean one of these PDFs on your system?\n{cand_list}"
+            return f"❌ PDF not found: {path}"
+
+    text = ""
+
+    # Engine 1: pdftotext (poppler)
     try:
         import subprocess
         cmd = ["pdftotext", str(p), "-"]
@@ -198,14 +256,62 @@ def tool_read_pdf(path: str, max_pages: int | None = None) -> str:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0 and result.stdout.strip():
             text = result.stdout.strip()
-            if len(text) > 20000:
-                text = text[:20000] + "\n... (truncated)"
-            return f"PDF Content ({p.name}):\n\n{text}"
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except Exception:
         pass
 
-    # Fallback message
-    return f"❌ Cannot read PDF. Install poppler: brew install poppler"
+    # Engine 2: pypdf
+    if not text:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(p))
+            target_page_count = max_pages if max_pages else len(reader.pages)
+            extracted = []
+            for page in reader.pages:
+                t = page.extract_text()
+                if t and t.strip():
+                    extracted.append(t.strip())
+                    if len(extracted) >= target_page_count:
+                        break
+            if extracted:
+                text = "\n\n".join(extracted)
+        except Exception:
+            pass
+
+    # Engine 3: fitz (PyMuPDF)
+    if not text:
+        try:
+            import fitz
+            doc = fitz.open(str(p))
+            target_page_count = max_pages if max_pages else len(doc)
+            extracted = []
+            for page in doc:
+                t = page.get_text()
+                if t and t.strip():
+                    extracted.append(t.strip())
+                    if len(extracted) >= target_page_count:
+                        break
+            if extracted:
+                text = "\n\n".join(extracted)
+        except Exception:
+            pass
+
+    # Engine 4: pdfminer
+    if not text:
+        try:
+            from pdfminer.high_level import extract_text as pdfminer_extract
+            text = pdfminer_extract(str(p), maxpages=max_pages or 0)
+        except Exception:
+            pass
+
+    if not text or not text.strip():
+        return f"❌ PDF found at '{p}' but text extraction yielded empty content."
+
+    text = text.strip()
+    if len(text) > 30000:
+        text = text[:30000] + "\n\n... (truncated for length)"
+
+    return f"{resolved_note}PDF Content ({p.name}):\n\n{text}"
+
 
 
 def tool_save_research(title: str, content: str, output_path: str = "") -> str:
