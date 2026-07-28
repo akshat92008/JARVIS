@@ -32,14 +32,10 @@ class ApprovalStatus(StrEnum):
     REJECTED = "rejected"
     CHANGES_REQUESTED = "changes_requested"
     POSTPONED = "postponed"
+    EXPIRED = "expired"
 
 
-RISK_ORDER = {
-    RiskLevel.LOW: 0,
-    RiskLevel.MEDIUM: 1,
-    RiskLevel.HIGH: 2,
-    RiskLevel.CRITICAL: 3,
-}
+RISK_ORDER = {RiskLevel.LOW: 0, RiskLevel.MEDIUM: 1, RiskLevel.HIGH: 2, RiskLevel.CRITICAL: 3}
 
 
 @dataclass(frozen=True, slots=True)

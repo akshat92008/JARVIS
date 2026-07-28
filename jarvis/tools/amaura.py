@@ -8,6 +8,7 @@ from typing import Any
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.executor import GovernedTaskRunner
+from jarvis.amaura.supervisor import AmauraSupervisor
 
 
 _CONTROL: AmauraControlPlane | None = None
@@ -159,6 +160,28 @@ AMAURA_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "amaura_supervisor_status",
+            "description": "Read durable execution leases, queue depth, retries, reviews, and founder approval waits.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_supervisor_tick",
+            "description": "Have JARVIS atomically advance one dependency-ready task or independent review with crash recovery.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "automatic_reviews": {"type": "boolean", "default": True},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "amaura_review_task",
             "description": "Record an independent reviewer decision. The reviewer must match the registry and cannot be the task owner.",
             "parameters": {
@@ -277,6 +300,17 @@ def task_packet(task_id: str) -> str:
 def run_task(task_id: str, max_iterations: int = 12) -> str:
     return _json(GovernedTaskRunner(get_control_plane()).run(task_id, max_iterations))
 
+def supervisor_status() -> str:
+    return _json(AmauraSupervisor(get_control_plane(), worker_id="jarvis-tool").status())
+
+
+def supervisor_tick(workflow_id: str = "", automatic_reviews: bool = True) -> str:
+    return _json(AmauraSupervisor(
+        get_control_plane(),
+        worker_id="jarvis-tool",
+        automatic_reviews=automatic_reviews,
+    ).tick(workflow_id=workflow_id or None))
+
 
 def review_task(task_id: str, reviewer_id: str, approve: bool, findings: str) -> str:
     return _json(get_control_plane().review_task(task_id, reviewer_id, approve, findings))
@@ -314,6 +348,8 @@ AMAURA_DISPATCH = {
     "amaura_list_tasks": list_tasks,
     "amaura_task_packet": task_packet,
     "amaura_run_task": run_task,
+    "amaura_supervisor_status": supervisor_status,
+    "amaura_supervisor_tick": supervisor_tick,
     "amaura_review_task": review_task,
     "amaura_pending_approvals": pending_approvals,
     "amaura_pause_agent": pause_agent,

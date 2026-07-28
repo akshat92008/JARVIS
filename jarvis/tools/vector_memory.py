@@ -9,6 +9,7 @@ import sqlite3
 import time
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+from jarvis.paths import get_data_dir
 
 VECTOR_MEMORY_TOOL_DEFINITIONS = [
     {
@@ -207,7 +208,7 @@ class VectorEmbeddingEngine:
 class JarvisVectorBrain:
     def __init__(self, db_path: Optional[str] = None):
         if not db_path:
-            db_path = os.path.join(os.path.expanduser("~"), ".jarvis_vector_brain.db")
+            db_path = str(get_data_dir() / "vector_brain.db")
         self.db_path = db_path
         self._init_db()
 

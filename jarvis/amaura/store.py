@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import threading
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+
 from jarvis.paths import get_data_dir
 
 
@@ -19,15 +22,38 @@ def utc_now() -> str:
 class CompanyStore:
     """Thread-safe, append-audited company state store."""
 
-    JSON_COLUMNS = {
-        "acceptance_criteria", "dependencies", "evidence", "metadata", "payload", "details",
-        "config", "score_components", "output", "metrics", "lesson", "asset_metadata",
+    JSON_COLUMNS: ClassVar[set[str]] = {
+        "acceptance_criteria",
+        "dependencies",
+        "evidence",
+        "metadata",
+        "payload",
+        "details",
+        "config",
+        "score_components",
+        "output",
+        "metrics",
+        "lesson",
+        "asset_metadata",
         "evidence_snapshot",
+        "result",
     }
-    MUTABLE_WORK_FIELDS = {
-        "owner_id", "reviewer_id", "state", "priority", "deadline", "budget_cents",
-        "spent_cents", "risk", "success_metric", "acceptance_criteria", "dependencies",
-        "evidence", "summary", "action_type", "metadata",
+    MUTABLE_WORK_FIELDS: ClassVar[set[str]] = {
+        "owner_id",
+        "reviewer_id",
+        "state",
+        "priority",
+        "deadline",
+        "budget_cents",
+        "spent_cents",
+        "risk",
+        "success_metric",
+        "acceptance_criteria",
+        "dependencies",
+        "evidence",
+        "summary",
+        "action_type",
+        "metadata",
     }
 
     def __init__(self, db_path: str | Path | None = None):
@@ -51,8 +77,14 @@ class CompanyStore:
             integrity = [row[0] for row in self._connection.execute("PRAGMA integrity_check").fetchall()]
             foreign_keys = [dict(row) for row in self._connection.execute("PRAGMA foreign_key_check").fetchall()]
             journal_mode = self._connection.execute("PRAGMA journal_mode").fetchone()[0]
-        return {"ok": integrity == ["ok"] and not foreign_keys, "integrity": integrity,
-                "foreign_key_violations": foreign_keys, "journal_mode": journal_mode}
+        audit_chain = self.audit_chain_check()
+        return {
+            "ok": integrity == ["ok"] and not foreign_keys and audit_chain["ok"],
+            "integrity": integrity,
+            "foreign_key_violations": foreign_keys,
+            "journal_mode": journal_mode,
+            "audit_chain": audit_chain,
+        }
 
     def backup(self, destination: str | Path) -> Path:
         """Create a transactionally consistent SQLite backup."""
@@ -112,10 +144,14 @@ class CompanyStore:
             decided_by TEXT,
             reason TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL DEFAULT '{}',
+            payload_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
+            expires_at TEXT,
             resolved_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_pending_approval_per_task
+            ON approvals(task_id) WHERE status = 'pending';
 
         CREATE TABLE IF NOT EXISTS events (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +170,8 @@ class CompanyStore:
             resource_id TEXT NOT NULL,
             outcome TEXT NOT NULL,
             details TEXT NOT NULL DEFAULT '{}',
+            prev_hash TEXT NOT NULL DEFAULT '',
+            entry_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -173,6 +211,24 @@ class CompanyStore:
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_cost_task ON costs(task_id);
+
+        CREATE TABLE IF NOT EXISTS execution_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES work_items(id),
+            worker_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK(attempt > 0),
+            state TEXT NOT NULL,
+            lease_until TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_execution_runs_task ON execution_runs(task_id, attempt);
+        CREATE INDEX IF NOT EXISTS idx_execution_runs_state_lease ON execution_runs(state, lease_until);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_execution_per_task
+            ON execution_runs(task_id) WHERE state IN ('leased', 'running');
 
         CREATE TABLE IF NOT EXISTS campaigns (
             id TEXT PRIMARY KEY,
@@ -330,7 +386,85 @@ class CompanyStore:
         """
         with self._lock:
             self._connection.executescript(schema)
+            self._ensure_column("approvals", "payload_hash", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("approvals", "expires_at", "TEXT")
+            self._ensure_column("audit_logs", "prev_hash", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("audit_logs", "entry_hash", "TEXT NOT NULL DEFAULT ''")
+            self._backfill_approval_integrity()
+            self._backfill_audit_hash_chain()
             self._connection.commit()
+
+    def _ensure_column(self, table: str, column: str, declaration: str) -> None:
+        columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    @staticmethod
+    def canonical_hash(value: Any) -> str:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _backfill_approval_integrity(self) -> None:
+        rows = self._connection.execute("SELECT id,payload,payload_hash,created_at,expires_at FROM approvals").fetchall()
+        for row in rows:
+            changes: dict[str, str] = {}
+            if not row["payload_hash"]:
+                try:
+                    payload = json.loads(row["payload"])
+                except json.JSONDecodeError:
+                    payload = row["payload"]
+                changes["payload_hash"] = self.canonical_hash(payload)
+            if not row["expires_at"]:
+                created_at = datetime.fromisoformat(row["created_at"])
+                changes["expires_at"] = (created_at + timedelta(hours=48)).isoformat()
+            if changes:
+                self._connection.execute(f"UPDATE approvals SET {', '.join(f'{key}=?' for key in changes)} WHERE id=?", [*changes.values(), row["id"]])
+
+    @staticmethod
+    def _audit_digest(*, previous: str, actor: str, action: str, resource_type: str, resource_id: str, outcome: str, details_json: str, created_at: str) -> str:
+        entry = {"actor": actor, "action": action, "resource_type": resource_type, "resource_id": resource_id, "outcome": outcome, "details": details_json, "created_at": created_at}
+        payload = previous + json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _backfill_audit_hash_chain(self) -> None:
+        previous = ""
+        rows = self._connection.execute("SELECT * FROM audit_logs ORDER BY sequence").fetchall()
+        for row in rows:
+            expected = self._audit_digest(
+                previous=previous,
+                actor=row["actor"],
+                action=row["action"],
+                resource_type=row["resource_type"],
+                resource_id=row["resource_id"],
+                outcome=row["outcome"],
+                details_json=row["details"],
+                created_at=row["created_at"],
+            )
+            if not row["entry_hash"]:
+                self._connection.execute("UPDATE audit_logs SET prev_hash=?,entry_hash=? WHERE sequence=?", (previous, expected, row["sequence"]))
+                previous = expected
+            else:
+                previous = row["entry_hash"]
+
+    def audit_chain_check(self) -> dict[str, Any]:
+        previous = ""
+        with self._lock:
+            rows = self._connection.execute("SELECT * FROM audit_logs ORDER BY sequence").fetchall()
+        for row in rows:
+            expected = self._audit_digest(
+                previous=previous,
+                actor=row["actor"],
+                action=row["action"],
+                resource_type=row["resource_type"],
+                resource_id=row["resource_id"],
+                outcome=row["outcome"],
+                details_json=row["details"],
+                created_at=row["created_at"],
+            )
+            if row["prev_hash"] != previous or row["entry_hash"] != expected:
+                return {"ok": False, "broken_at_sequence": row["sequence"], "entries": len(rows)}
+            previous = row["entry_hash"]
+        return {"ok": True, "broken_at_sequence": None, "entries": len(rows), "head": previous}
 
     @staticmethod
     def _decode_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -377,10 +511,7 @@ class CompanyStore:
 
     def set_agent_enabled(self, agent_id: str, enabled: bool) -> dict[str, Any]:
         with self._lock:
-            cursor = self._connection.execute(
-                "UPDATE agents SET enabled = ?, updated_at = ? WHERE agent_id = ?",
-                (int(enabled), utc_now(), agent_id),
-            )
+            cursor = self._connection.execute("UPDATE agents SET enabled = ?, updated_at = ? WHERE agent_id = ?", (int(enabled), utc_now(), agent_id))
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown Amaura agent: {agent_id}")
             self._connection.commit()
@@ -389,27 +520,56 @@ class CompanyStore:
     def insert_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         values = {
-            "parent_id": None, "workflow_id": None, "description": "", "reviewer_id": None,
-            "state": "assigned", "priority": 3, "deadline": None, "budget_cents": 0,
-            "spent_cents": 0, "risk": "low", "action_type": "internal_work",
-            "success_metric": "", "acceptance_criteria": [], "dependencies": [], "evidence": [],
-            "summary": "", "metadata": {}, **item,
+            "parent_id": None,
+            "workflow_id": None,
+            "description": "",
+            "reviewer_id": None,
+            "state": "assigned",
+            "priority": 3,
+            "deadline": None,
+            "budget_cents": 0,
+            "spent_cents": 0,
+            "risk": "low",
+            "action_type": "internal_work",
+            "success_metric": "",
+            "acceptance_criteria": [],
+            "dependencies": [],
+            "evidence": [],
+            "summary": "",
+            "metadata": {},
+            **item,
         }
         columns = (
-            "id", "parent_id", "item_type", "workflow_id", "title", "description", "owner_id",
-            "reviewer_id", "state", "priority", "deadline", "budget_cents", "spent_cents", "risk",
-            "action_type", "success_metric", "acceptance_criteria", "dependencies", "evidence",
-            "summary", "metadata", "created_at", "updated_at",
+            "id",
+            "parent_id",
+            "item_type",
+            "workflow_id",
+            "title",
+            "description",
+            "owner_id",
+            "reviewer_id",
+            "state",
+            "priority",
+            "deadline",
+            "budget_cents",
+            "spent_cents",
+            "risk",
+            "action_type",
+            "success_metric",
+            "acceptance_criteria",
+            "dependencies",
+            "evidence",
+            "summary",
+            "metadata",
+            "created_at",
+            "updated_at",
         )
         values["created_at"] = now
         values["updated_at"] = now
         encoded = [json.dumps(values[c]) if c in self.JSON_COLUMNS else values[c] for c in columns]
         placeholders = ", ".join("?" for _ in columns)
         with self._lock:
-            self._connection.execute(
-                f"INSERT INTO work_items({', '.join(columns)}) VALUES({placeholders})",
-                encoded,
-            )
+            self._connection.execute(f"INSERT INTO work_items({', '.join(columns)}) VALUES({placeholders})", encoded)
             self._connection.commit()
         return self.get_work_item(values["id"])
 
@@ -421,15 +581,7 @@ class CompanyStore:
             raise KeyError(f"Unknown work item: {item_id}")
         return decoded
 
-    def list_work_items(
-        self,
-        *,
-        item_type: str | None = None,
-        state: str | None = None,
-        owner_id: str | None = None,
-        parent_id: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
+    def list_work_items(self, *, item_type: str | None = None, state: str | None = None, owner_id: str | None = None, parent_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         for column, value in (("item_type", item_type), ("state", state), ("owner_id", owner_id), ("parent_id", parent_id)):
@@ -439,9 +591,7 @@ class CompanyStore:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(max(1, min(limit, 1000)))
         with self._lock:
-            rows = self._connection.execute(
-                f"SELECT * FROM work_items{where} ORDER BY priority ASC, created_at ASC LIMIT ?", params
-            ).fetchall()
+            rows = self._connection.execute(f"SELECT * FROM work_items{where} ORDER BY priority ASC, created_at ASC LIMIT ?", params).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def update_work_item(self, item_id: str, **fields: Any) -> dict[str, Any]:
@@ -458,9 +608,7 @@ class CompanyStore:
             params.append(json.dumps(value) if key in self.JSON_COLUMNS else value)
         params.append(item_id)
         with self._lock:
-            cursor = self._connection.execute(
-                f"UPDATE work_items SET {', '.join(assignments)} WHERE id = ?", params
-            )
+            cursor = self._connection.execute(f"UPDATE work_items SET {', '.join(assignments)} WHERE id = ?", params)
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown work item: {item_id}")
             self._connection.commit()
@@ -468,16 +616,38 @@ class CompanyStore:
 
     def create_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
-        values = {"status": "pending", "decided_by": None, "reason": "", "payload": {}, **approval}
+        values = {"status": "pending", "decided_by": None, "reason": "", "payload": {}, "expires_at": (datetime.now(UTC) + timedelta(hours=48)).isoformat(), **approval}
+        payload_json = json.dumps(values["payload"], sort_keys=True, separators=(",", ":"), default=str)
+        payload_hash = self.canonical_hash(values["payload"])
         with self._lock:
-            self._connection.execute(
-                """INSERT INTO approvals(id, task_id, action_type, risk, status, requested_by,
-                decided_by, reason, payload, created_at, resolved_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
-                (values["id"], values["task_id"], values["action_type"], values["risk"], values["status"],
-                 values["requested_by"], values["decided_by"], values["reason"], json.dumps(values["payload"]), now),
-            )
-            self._connection.commit()
+            try:
+                self._connection.execute(
+                    """INSERT INTO approvals(id, task_id, action_type, risk, status, requested_by,
+                    decided_by, reason, payload, payload_hash, created_at, expires_at, resolved_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                    (
+                        values["id"],
+                        values["task_id"],
+                        values["action_type"],
+                        values["risk"],
+                        values["status"],
+                        values["requested_by"],
+                        values["decided_by"],
+                        values["reason"],
+                        payload_json,
+                        payload_hash,
+                        now,
+                        values["expires_at"],
+                    ),
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                if "approvals.task_id" in str(exc):
+                    existing = self._connection.execute("SELECT id FROM approvals WHERE task_id=? AND status='pending'", (values["task_id"],)).fetchone()
+                    if existing:
+                        return self.get_approval(existing["id"])
+                raise
         return self.get_approval(values["id"])
 
     def get_approval(self, approval_id: str) -> dict[str, Any]:
@@ -500,26 +670,42 @@ class CompanyStore:
             rows = self._connection.execute(query, params).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
+    def expire_stale_approvals(self) -> int:
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE approvals SET status='expired',resolved_at=?
+                WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<=?""",
+                (utc_now(), utc_now()),
+            )
+            self._connection.commit()
+        return cursor.rowcount
+
     def resolve_approval(self, approval_id: str, status: str, decided_by: str, reason: str) -> dict[str, Any]:
         with self._lock:
+            current = self._connection.execute("SELECT status,expires_at FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            if current is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            if current["status"] != "pending":
+                raise ValueError(f"Approval is already {current['status']}")
+            if current["expires_at"] and datetime.fromisoformat(current["expires_at"]) <= datetime.now(UTC):
+                self._connection.execute("UPDATE approvals SET status='expired',resolved_at=? WHERE id=? AND status='pending'", (utc_now(), approval_id))
+                self._connection.commit()
+                raise ValueError("Approval has expired and must be requested again")
             cursor = self._connection.execute(
                 """UPDATE approvals SET status = ?, decided_by = ?, reason = ?, resolved_at = ?
                 WHERE id = ? AND status = 'pending'""",
                 (status, decided_by, reason, utc_now(), approval_id),
             )
             if cursor.rowcount != 1:
-                current = self.get_approval(approval_id)
-                raise ValueError(f"Approval is already {current['status']}")
+                latest = self.get_approval(approval_id)
+                raise ValueError(f"Approval is already {latest['status']}")
             self._connection.commit()
         return self.get_approval(approval_id)
 
     def publish_event(self, event_type: str, aggregate_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         created_at = utc_now()
         with self._lock:
-            cursor = self._connection.execute(
-                "INSERT INTO events(event_type, aggregate_id, payload, created_at) VALUES(?, ?, ?, ?)",
-                (event_type, aggregate_id, json.dumps(payload), created_at),
-            )
+            cursor = self._connection.execute("INSERT INTO events(event_type, aggregate_id, payload, created_at) VALUES(?, ?, ?, ?)", (event_type, aggregate_id, json.dumps(payload), created_at))
             self._connection.commit()
         return {"sequence": cursor.lastrowid, "event_type": event_type, "aggregate_id": aggregate_id, "payload": payload, "created_at": created_at}
 
@@ -536,19 +722,24 @@ class CompanyStore:
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def audit(self, actor: str, action: str, resource_type: str, resource_id: str, outcome: str, details: dict[str, Any] | None = None) -> None:
+        created_at = utc_now()
+        details_json = json.dumps(details or {}, sort_keys=True, separators=(",", ":"), default=str)
         with self._lock:
+            row = self._connection.execute("SELECT entry_hash FROM audit_logs ORDER BY sequence DESC LIMIT 1").fetchone()
+            previous = row["entry_hash"] if row else ""
+            entry_hash = self._audit_digest(
+                previous=previous, actor=actor, action=action, resource_type=resource_type, resource_id=resource_id, outcome=outcome, details_json=details_json, created_at=created_at
+            )
             self._connection.execute(
-                """INSERT INTO audit_logs(actor, action, resource_type, resource_id, outcome, details, created_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?)""",
-                (actor, action, resource_type, resource_id, outcome, json.dumps(details or {}), utc_now()),
+                """INSERT INTO audit_logs(actor, action, resource_type, resource_id, outcome, details,
+                prev_hash,entry_hash,created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (actor, action, resource_type, resource_id, outcome, details_json, previous, entry_hash, created_at),
             )
             self._connection.commit()
 
     def list_audit(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM audit_logs ORDER BY sequence DESC LIMIT ?", (max(1, min(limit, 1000)),)
-            ).fetchall()
+            rows = self._connection.execute("SELECT * FROM audit_logs ORDER BY sequence DESC LIMIT ?", (max(1, min(limit, 1000)),)).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def record_cost(self, entry: dict[str, Any]) -> None:
@@ -557,13 +748,9 @@ class CompanyStore:
             self._connection.execute(
                 """INSERT INTO costs(id, task_id, agent_id, category, amount_cents, units, unit_name, metadata, created_at)
                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (entry["id"], entry["task_id"], entry["agent_id"], entry["category"], entry["amount_cents"],
-                 entry.get("units", 0), entry.get("unit_name", ""), json.dumps(metadata), utc_now()),
+                (entry["id"], entry["task_id"], entry["agent_id"], entry["category"], entry["amount_cents"], entry.get("units", 0), entry.get("unit_name", ""), json.dumps(metadata), utc_now()),
             )
-            self._connection.execute(
-                "UPDATE work_items SET spent_cents = spent_cents + ?, updated_at = ? WHERE id = ?",
-                (entry["amount_cents"], utc_now(), entry["task_id"]),
-            )
+            self._connection.execute("UPDATE work_items SET spent_cents = spent_cents + ?, updated_at = ? WHERE id = ?", (entry["amount_cents"], utc_now(), entry["task_id"]))
             self._connection.commit()
 
     def upsert_knowledge(self, namespace: str, key: str, value: Any, evidence_refs: list[str], sensitivity: str, actor: str) -> None:
@@ -583,9 +770,18 @@ class CompanyStore:
             self._connection.execute(
                 """INSERT INTO decisions(id, decision, context, options, chosen_option, reason, owner,
                 review_date, outcome, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (decision["id"], decision["decision"], decision["context"], json.dumps(decision["options"]),
-                 decision["chosen_option"], decision["reason"], decision["owner"], decision.get("review_date"),
-                 decision.get("outcome", ""), utc_now()),
+                (
+                    decision["id"],
+                    decision["decision"],
+                    decision["context"],
+                    json.dumps(decision["options"]),
+                    decision["chosen_option"],
+                    decision["reason"],
+                    decision["owner"],
+                    decision.get("review_date"),
+                    decision.get("outcome", ""),
+                    utc_now(),
+                ),
             )
             self._connection.commit()
 
@@ -593,11 +789,7 @@ class CompanyStore:
 
     def upsert_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
-        values = {
-            "minimum_score": 70, "active": True, "daily_lead_limit": 10,
-            "daily_outreach_limit": 3, "daily_followup_limit": 5,
-            "maximum_followups": 2, "config": {}, **campaign,
-        }
+        values = {"minimum_score": 70, "active": True, "daily_lead_limit": 10, "daily_outreach_limit": 3, "daily_followup_limit": 5, "maximum_followups": 2, "config": {}, **campaign}
         with self._lock:
             self._connection.execute(
                 """INSERT INTO campaigns(id,name,target_segment,offer,minimum_score,active,
@@ -608,10 +800,21 @@ class CompanyStore:
                 daily_lead_limit=excluded.daily_lead_limit,daily_outreach_limit=excluded.daily_outreach_limit,
                 daily_followup_limit=excluded.daily_followup_limit,maximum_followups=excluded.maximum_followups,
                 config=excluded.config,updated_at=excluded.updated_at""",
-                (values["id"], values["name"], values["target_segment"], values["offer"],
-                 values["minimum_score"], int(values["active"]), values["daily_lead_limit"],
-                 values["daily_outreach_limit"], values["daily_followup_limit"], values["maximum_followups"],
-                 json.dumps(values["config"]), now, now),
+                (
+                    values["id"],
+                    values["name"],
+                    values["target_segment"],
+                    values["offer"],
+                    values["minimum_score"],
+                    int(values["active"]),
+                    values["daily_lead_limit"],
+                    values["daily_outreach_limit"],
+                    values["daily_followup_limit"],
+                    values["maximum_followups"],
+                    json.dumps(values["config"]),
+                    now,
+                    now,
+                ),
             )
             self._connection.commit()
         return self.get_campaign(values["id"])
@@ -636,20 +839,28 @@ class CompanyStore:
     def insert_lead(self, lead: dict[str, Any], *, daily_limit: int | None = None, day_prefix: str = "") -> dict[str, Any]:
         now = utc_now()
         values = {
-            "contact_name": "", "public_contact": "", "contact_source_url": "",
-            "linkedin_url": "", "country": "", "industry": "", "stage": "discovered",
-            "total_score": 0, "score_components": {}, "do_not_contact": False,
-            "opt_out_reason": "", "estimated_value_cents": 0, "next_action": "",
-            "next_action_at": None, "metadata": {}, **lead,
+            "contact_name": "",
+            "public_contact": "",
+            "contact_source_url": "",
+            "linkedin_url": "",
+            "country": "",
+            "industry": "",
+            "stage": "discovered",
+            "total_score": 0,
+            "score_components": {},
+            "do_not_contact": False,
+            "opt_out_reason": "",
+            "estimated_value_cents": 0,
+            "next_action": "",
+            "next_action_at": None,
+            "metadata": {},
+            **lead,
         }
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 if daily_limit is not None:
-                    count = self._connection.execute(
-                        "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND created_at LIKE ?",
-                        (values["campaign_id"], f"{day_prefix}%"),
-                    ).fetchone()[0]
+                    count = self._connection.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=? AND created_at LIKE ?", (values["campaign_id"], f"{day_prefix}%")).fetchone()[0]
                     if count >= daily_limit:
                         raise ValueError("Daily lead discovery limit reached")
                 self._connection.execute(
@@ -657,12 +868,29 @@ class CompanyStore:
                     contact_source_url,linkedin_url,country,industry,stage,total_score,score_components,
                     do_not_contact,opt_out_reason,estimated_value_cents,next_action,next_action_at,metadata,
                     created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (values["id"], values["campaign_id"], values["company_name"], values["domain"],
-                     values["contact_name"], values["public_contact"], values["contact_source_url"],
-                     values["linkedin_url"], values["country"], values["industry"], values["stage"],
-                     values["total_score"], json.dumps(values["score_components"]), int(values["do_not_contact"]),
-                     values["opt_out_reason"], values["estimated_value_cents"], values["next_action"],
-                     values["next_action_at"], json.dumps(values["metadata"]), now, now),
+                    (
+                        values["id"],
+                        values["campaign_id"],
+                        values["company_name"],
+                        values["domain"],
+                        values["contact_name"],
+                        values["public_contact"],
+                        values["contact_source_url"],
+                        values["linkedin_url"],
+                        values["country"],
+                        values["industry"],
+                        values["stage"],
+                        values["total_score"],
+                        json.dumps(values["score_components"]),
+                        int(values["do_not_contact"]),
+                        values["opt_out_reason"],
+                        values["estimated_value_cents"],
+                        values["next_action"],
+                        values["next_action_at"],
+                        json.dumps(values["metadata"]),
+                        now,
+                        now,
+                    ),
                 )
                 self._connection.commit()
             except Exception:
@@ -701,9 +929,23 @@ class CompanyStore:
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def update_lead(self, lead_id: str, **fields: Any) -> dict[str, Any]:
-        allowed = {"stage", "total_score", "score_components", "do_not_contact", "opt_out_reason",
-                   "estimated_value_cents", "next_action", "next_action_at", "metadata", "contact_name",
-                   "public_contact", "contact_source_url", "linkedin_url", "country", "industry"}
+        allowed = {
+            "stage",
+            "total_score",
+            "score_components",
+            "do_not_contact",
+            "opt_out_reason",
+            "estimated_value_cents",
+            "next_action",
+            "next_action_at",
+            "metadata",
+            "contact_name",
+            "public_contact",
+            "contact_source_url",
+            "linkedin_url",
+            "country",
+            "industry",
+        }
         invalid = set(fields) - allowed
         if invalid:
             raise ValueError(f"Invalid lead fields: {', '.join(sorted(invalid))}")
@@ -732,9 +974,18 @@ class CompanyStore:
             self._connection.execute(
                 """INSERT INTO lead_evidence(id,lead_id,claim_type,claim,source_url,source_excerpt,
                 retrieved_at,confidence,content_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (values["id"], values["lead_id"], values["claim_type"], values["claim"],
-                 values["source_url"], values["source_excerpt"], values["retrieved_at"],
-                 values["confidence"], values["content_hash"], utc_now()),
+                (
+                    values["id"],
+                    values["lead_id"],
+                    values["claim_type"],
+                    values["claim"],
+                    values["source_url"],
+                    values["source_excerpt"],
+                    values["retrieved_at"],
+                    values["confidence"],
+                    values["content_hash"],
+                    utc_now(),
+                ),
             )
             self._connection.commit()
         with self._lock:
@@ -743,25 +994,35 @@ class CompanyStore:
 
     def list_lead_evidence(self, lead_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM lead_evidence WHERE lead_id=? ORDER BY created_at", (lead_id,)
-            ).fetchall()
+            rows = self._connection.execute("SELECT * FROM lead_evidence WHERE lead_id=? ORDER BY created_at", (lead_id,)).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def insert_message(self, message: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
-        values = {"subject": "", "status": "draft", "approved_by": None, "approved_at": None,
-                  "sent_at": None, "external_message_id": None, "thread_id": None,
-                  "evidence_snapshot": [], **message}
+        values = {"subject": "", "status": "draft", "approved_by": None, "approved_at": None, "sent_at": None, "external_message_id": None, "thread_id": None, "evidence_snapshot": [], **message}
         with self._lock:
             self._connection.execute(
                 """INSERT INTO messages(id,lead_id,channel,message_type,subject,body,status,approved_by,
                 approved_at,sent_at,external_message_id,thread_id,idempotency_key,evidence_snapshot,
                 created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (values["id"], values["lead_id"], values["channel"], values["message_type"],
-                 values["subject"], values["body"], values["status"], values["approved_by"],
-                 values["approved_at"], values["sent_at"], values["external_message_id"], values["thread_id"],
-                 values["idempotency_key"], json.dumps(values["evidence_snapshot"]), now, now),
+                (
+                    values["id"],
+                    values["lead_id"],
+                    values["channel"],
+                    values["message_type"],
+                    values["subject"],
+                    values["body"],
+                    values["status"],
+                    values["approved_by"],
+                    values["approved_at"],
+                    values["sent_at"],
+                    values["external_message_id"],
+                    values["thread_id"],
+                    values["idempotency_key"],
+                    json.dumps(values["evidence_snapshot"]),
+                    now,
+                    now,
+                ),
             )
             self._connection.commit()
         return self.get_message(values["id"])
@@ -781,25 +1042,18 @@ class CompanyStore:
             raise ValueError(f"Invalid message fields: {', '.join(sorted(invalid))}")
         fields["updated_at"] = utc_now()
         with self._lock:
-            cursor = self._connection.execute(
-                f"UPDATE messages SET {', '.join(f'{key}=?' for key in fields)} WHERE id=?",
-                [*fields.values(), message_id],
-            )
+            cursor = self._connection.execute(f"UPDATE messages SET {', '.join(f'{key}=?' for key in fields)} WHERE id=?", [*fields.values(), message_id])
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown message: {message_id}")
             self._connection.commit()
         return self.get_message(message_id)
 
-    def confirm_message_sent_atomic(self, message_id: str, *, campaign_id: str, is_followup: bool,
-                                    daily_limit: int, since: str, external_message_id: str,
-                                    thread_id: str | None) -> dict[str, Any]:
+    def confirm_message_sent_atomic(self, message_id: str, *, campaign_id: str, is_followup: bool, daily_limit: int, since: str, external_message_id: str, thread_id: str | None) -> dict[str, Any]:
         """Atomically enforce a campaign cap and record provider-confirmed delivery."""
         with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-                message = self._connection.execute(
-                    "SELECT status FROM messages WHERE id=?", (message_id,)
-                ).fetchone()
+                message = self._connection.execute("SELECT status FROM messages WHERE id=?", (message_id,)).fetchone()
                 if message is None:
                     raise KeyError(f"Unknown message: {message_id}")
                 if message["status"] == "sent":
@@ -843,8 +1097,7 @@ class CompanyStore:
             rows = self._connection.execute(query, params).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
-    def publish_pipeline_event(self, *, lead_id: str | None, campaign_id: str | None, event_type: str,
-                               agent: str, input_hash: str, output: dict[str, Any]) -> dict[str, Any]:
+    def publish_pipeline_event(self, *, lead_id: str | None, campaign_id: str | None, event_type: str, agent: str, input_hash: str, output: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         with self._lock:
             cursor = self._connection.execute(
@@ -852,8 +1105,7 @@ class CompanyStore:
                 (lead_id, campaign_id, event_type, agent, input_hash, json.dumps(output), now),
             )
             self._connection.commit()
-        return {"sequence": cursor.lastrowid, "lead_id": lead_id, "campaign_id": campaign_id,
-                "event_type": event_type, "agent": agent, "input_hash": input_hash, "output": output, "created_at": now}
+        return {"sequence": cursor.lastrowid, "lead_id": lead_id, "campaign_id": campaign_id, "event_type": event_type, "agent": agent, "input_hash": input_hash, "output": output, "created_at": now}
 
     def list_pipeline_events(self, lead_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
         query = "SELECT * FROM pipeline_events"
@@ -870,8 +1122,7 @@ class CompanyStore:
     def record_idempotency(self, key: str, operation: str, resource_id: str, result_hash: str) -> bool:
         with self._lock:
             cursor = self._connection.execute(
-                "INSERT OR IGNORE INTO idempotency_records(idempotency_key,operation,resource_id,result_hash,created_at) VALUES(?,?,?,?,?)",
-                (key, operation, resource_id, result_hash, utc_now()),
+                "INSERT OR IGNORE INTO idempotency_records(idempotency_key,operation,resource_id,result_hash,created_at) VALUES(?,?,?,?,?)", (key, operation, resource_id, result_hash, utc_now())
             )
             self._connection.commit()
         return cursor.rowcount == 1
@@ -895,6 +1146,212 @@ class CompanyStore:
             row = self._connection.execute("SELECT value FROM system_controls WHERE key=?", (key,)).fetchone()
         return str(row[0]) if row else default
 
+    # -- Durable worker leases -------------------------------------------
+
+    def _get_execution(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM execution_runs WHERE id=?", (run_id,)).fetchone()
+        decoded = self._decode_row(row)
+        if decoded is None:
+            raise KeyError(f"Unknown execution run: {run_id}")
+        return decoded
+
+    def list_executions(self, *, state: str | None = None, task_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state=?")
+            params.append(state)
+        if task_id:
+            clauses.append("task_id=?")
+            params.append(task_id)
+        query = "SELECT * FROM execution_runs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY started_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._decode_row(row) for row in rows]  # type: ignore[misc]
+
+    def recover_expired_executions(self, *, max_attempts: int = 3) -> list[dict[str, Any]]:
+        """Expire abandoned leases and make retryable tasks available again."""
+        now = utc_now()
+        recovered: list[dict[str, Any]] = []
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                rows = self._connection.execute(
+                    """SELECT * FROM execution_runs
+                    WHERE state IN ('leased','running') AND lease_until<=?
+                    ORDER BY started_at""",
+                    (now,),
+                ).fetchall()
+                for row in rows:
+                    self._connection.execute(
+                        """UPDATE execution_runs
+                        SET state='expired',finished_at=?,error=?
+                        WHERE id=? AND state IN ('leased','running')""",
+                        (now, "Worker lease expired before completion", row["id"]),
+                    )
+                    retry = row["attempt"] < max(1, max_attempts)
+                    task_state = "assigned" if retry else "failed"
+                    self._connection.execute(
+                        """UPDATE work_items SET state=?,updated_at=?,
+                        summary=CASE WHEN summary='' THEN ? ELSE ? || '\n\n' || summary END
+                        WHERE id=? AND state='in_progress'""",
+                        (task_state, now, "Execution lease expired; JARVIS recovered the task.", "Execution lease expired; JARVIS recovered the task.", row["task_id"]),
+                    )
+                    recovered.append({"run_id": row["id"], "task_id": row["task_id"], "attempt": row["attempt"], "retry_scheduled": retry})
+                self._connection.commit()
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                raise
+        return recovered
+
+    def claim_next_task(self, *, worker_id: str, lease_seconds: int = 900, max_attempts: int = 3, workflow_id: str | None = None) -> dict[str, Any] | None:
+        """Atomically lease one dependency-ready task to one worker."""
+        if not worker_id.strip():
+            raise ValueError("worker_id is required")
+        lease_seconds = max(30, min(int(lease_seconds), 86_400))
+        max_attempts = max(1, min(int(max_attempts), 20))
+        self.recover_expired_executions(max_attempts=max_attempts)
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        lease_until = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        run_id = f"run_{uuid.uuid4().hex[:16]}"
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                params: list[Any] = []
+                workflow_clause = ""
+                if workflow_id:
+                    workflow_clause = " AND w.workflow_id=?"
+                    params.append(workflow_id)
+                candidates = self._connection.execute(
+                    f"""SELECT w.* FROM work_items w
+                    JOIN agents a ON a.agent_id=w.owner_id AND a.enabled=1
+                    WHERE w.item_type='task' AND w.state IN ('assigned','blocked')
+                    {workflow_clause}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM execution_runs r
+                        WHERE r.task_id=w.id AND r.state IN ('leased','running')
+                    )
+                    ORDER BY w.priority ASC,w.created_at ASC LIMIT 200""",
+                    params,
+                ).fetchall()
+                selected: sqlite3.Row | None = None
+                attempt = 0
+                for candidate in candidates:
+                    try:
+                        dependencies = json.loads(candidate["dependencies"])
+                    except json.JSONDecodeError:
+                        dependencies = []
+                    if dependencies:
+                        placeholders = ",".join("?" for _ in dependencies)
+                        incomplete = self._connection.execute(
+                            f"""SELECT COUNT(*) FROM work_items
+                            WHERE id IN ({placeholders}) AND state!='completed'""",
+                            dependencies,
+                        ).fetchone()[0]
+                        if incomplete:
+                            if candidate["state"] != "blocked":
+                                self._connection.execute("UPDATE work_items SET state='blocked',updated_at=? WHERE id=?", (now, candidate["id"]))
+                            continue
+                    prior = self._connection.execute("SELECT COALESCE(MAX(attempt),0) FROM execution_runs WHERE task_id=?", (candidate["id"],)).fetchone()[0]
+                    if prior >= max_attempts:
+                        self._connection.execute("UPDATE work_items SET state='failed',updated_at=? WHERE id=?", (now, candidate["id"]))
+                        continue
+                    selected = candidate
+                    attempt = prior + 1
+                    break
+                if selected is None:
+                    self._connection.commit()
+                    return None
+                cursor = self._connection.execute(
+                    """UPDATE work_items SET state='in_progress',updated_at=?
+                    WHERE id=? AND state IN ('assigned','blocked')""",
+                    (now, selected["id"]),
+                )
+                if cursor.rowcount != 1:
+                    self._connection.rollback()
+                    return None
+                self._connection.execute(
+                    """INSERT INTO execution_runs(
+                    id,task_id,worker_id,attempt,state,lease_until,heartbeat_at,started_at,result
+                    ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (run_id, selected["id"], worker_id.strip(), attempt, "running", lease_until, now, now, "{}"),
+                )
+                self._connection.commit()
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                raise
+        return {"run": self._get_execution(run_id), "task": self.get_work_item(selected["id"])}
+
+    def heartbeat_execution(self, run_id: str, *, worker_id: str, lease_seconds: int = 900) -> dict[str, Any]:
+        now_dt = datetime.now(UTC)
+        lease_until = (now_dt + timedelta(seconds=max(30, min(int(lease_seconds), 86_400)))).isoformat()
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE execution_runs SET heartbeat_at=?,lease_until=?
+                WHERE id=? AND worker_id=? AND state='running'""",
+                (now_dt.isoformat(), lease_until, run_id, worker_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Execution lease is no longer active or belongs to another worker")
+            self._connection.commit()
+        return self._get_execution(run_id)
+
+    def finish_execution(self, run_id: str, *, worker_id: str, succeeded: bool, result: dict[str, Any] | None = None, error: str = "", retryable: bool = True, max_attempts: int = 3) -> dict[str, Any]:
+        """Close a lease and deterministically retry or fail an interrupted task."""
+        now = utc_now()
+        with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                run = self._connection.execute("SELECT * FROM execution_runs WHERE id=?", (run_id,)).fetchone()
+                if run is None:
+                    raise KeyError(f"Unknown execution run: {run_id}")
+                if run["worker_id"] != worker_id:
+                    raise ValueError("Execution lease belongs to another worker")
+                if run["state"] != "running":
+                    raise ValueError(f"Execution run is already {run['state']}")
+                state = "succeeded" if succeeded else "failed"
+                self._connection.execute(
+                    """UPDATE execution_runs SET state=?,finished_at=?,heartbeat_at=?,
+                    error=?,result=? WHERE id=?""",
+                    (state, now, now, error[:4000], json.dumps(result or {}, sort_keys=True, default=str), run_id),
+                )
+                if not succeeded:
+                    retry = retryable and run["attempt"] < max(1, max_attempts)
+                    task_state = "assigned" if retry else "failed"
+                    summary = f"EXECUTION ATTEMPT {run['attempt']} FAILED: {error[:2000]}" if error else f"EXECUTION ATTEMPT {run['attempt']} FAILED"
+                    self._connection.execute(
+                        """UPDATE work_items SET state=?,updated_at=?,
+                        summary=CASE WHEN summary='' THEN ? ELSE ? || '\n\n' || summary END
+                        WHERE id=? AND state='in_progress'""",
+                        (task_state, now, summary, summary, run["task_id"]),
+                    )
+                self._connection.commit()
+            except Exception:
+                if self._connection.in_transaction:
+                    self._connection.rollback()
+                raise
+        return self._get_execution(run_id)
+
+    def execution_status(self) -> dict[str, Any]:
+        with self._lock:
+            counts = {row["state"]: row["count"] for row in self._connection.execute("SELECT state,COUNT(*) AS count FROM execution_runs GROUP BY state").fetchall()}
+            active = [
+                self._decode_row(row)
+                for row in self._connection.execute(
+                    """SELECT * FROM execution_runs WHERE state IN ('leased','running')
+                    ORDER BY started_at"""
+                ).fetchall()
+            ]
+        return {"counts": counts, "active": active}
+
     # -- Content factory --------------------------------------------------
 
     def create_content_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
@@ -903,8 +1360,7 @@ class CompanyStore:
         with self._lock:
             self._connection.execute(
                 "INSERT INTO content_campaigns(id,title,audience,business_objective,status,config,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (values["id"], values["title"], values["audience"], values["business_objective"],
-                 values["status"], json.dumps(values["config"]), now, now),
+                (values["id"], values["title"], values["audience"], values["business_objective"], values["status"], json.dumps(values["config"]), now, now),
             )
             self._connection.commit()
         return self.get_content_campaign(values["id"])
@@ -924,9 +1380,20 @@ class CompanyStore:
             self._connection.execute(
                 """INSERT INTO content_assets(id,campaign_id,asset_type,uri,sha256,status,source_url,
                 creator,licence,asset_metadata,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (values["id"], values["campaign_id"], values["asset_type"], values["uri"], values["sha256"],
-                 values["status"], values["source_url"], values["creator"], values["licence"],
-                 json.dumps(values["asset_metadata"]), now, now),
+                (
+                    values["id"],
+                    values["campaign_id"],
+                    values["asset_type"],
+                    values["uri"],
+                    values["sha256"],
+                    values["status"],
+                    values["source_url"],
+                    values["creator"],
+                    values["licence"],
+                    json.dumps(values["asset_metadata"]),
+                    now,
+                    now,
+                ),
             )
             self._connection.commit()
         with self._lock:
@@ -935,9 +1402,7 @@ class CompanyStore:
 
     def list_content_assets(self, campaign_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT * FROM content_assets WHERE campaign_id=? ORDER BY created_at", (campaign_id,)
-            ).fetchall()
+            rows = self._connection.execute("SELECT * FROM content_assets WHERE campaign_id=? ORDER BY created_at", (campaign_id,)).fetchall()
         return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def record_content_metrics(self, entry: dict[str, Any]) -> dict[str, Any]:
@@ -946,33 +1411,21 @@ class CompanyStore:
                 """INSERT INTO content_metrics(id,campaign_id,platform,window,captured_at,metrics)
                 VALUES(?,?,?,?,?,?) ON CONFLICT(campaign_id,platform,window) DO UPDATE SET
                 captured_at=excluded.captured_at,metrics=excluded.metrics""",
-                (entry["id"], entry["campaign_id"], entry["platform"], entry["window"],
-                 entry.get("captured_at", utc_now()), json.dumps(entry["metrics"])),
+                (entry["id"], entry["campaign_id"], entry["platform"], entry["window"], entry.get("captured_at", utc_now()), json.dumps(entry["metrics"])),
             )
             self._connection.commit()
         with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM content_metrics WHERE campaign_id=? AND platform=? AND window=?",
-                (entry["campaign_id"], entry["platform"], entry["window"]),
-            ).fetchone()
+            row = self._connection.execute("SELECT * FROM content_metrics WHERE campaign_id=? AND platform=? AND window=?", (entry["campaign_id"], entry["platform"], entry["window"])).fetchone()
         return self._decode_row(row)  # type: ignore[return-value]
 
     def dashboard(self) -> dict[str, Any]:
         with self._lock:
-            states = {row["state"]: row["count"] for row in self._connection.execute(
-                "SELECT state, COUNT(*) AS count FROM work_items WHERE item_type = 'task' GROUP BY state"
-            ).fetchall()}
-            departments = {row["department"]: row["count"] for row in self._connection.execute(
-                "SELECT department, COUNT(*) AS count FROM agents WHERE enabled = 1 GROUP BY department"
-            ).fetchall()}
+            states = {row["state"]: row["count"] for row in self._connection.execute("SELECT state, COUNT(*) AS count FROM work_items WHERE item_type = 'task' GROUP BY state").fetchall()}
+            departments = {row["department"]: row["count"] for row in self._connection.execute("SELECT department, COUNT(*) AS count FROM agents WHERE enabled = 1 GROUP BY department").fetchall()}
             pending = self._connection.execute("SELECT COUNT(*) FROM approvals WHERE status = 'pending'").fetchone()[0]
             total_cost = self._connection.execute("SELECT COALESCE(SUM(amount_cents), 0) FROM costs").fetchone()[0]
-            active_programmes = self._connection.execute(
-                "SELECT COUNT(*) FROM work_items WHERE item_type = 'programme' AND state NOT IN ('completed','cancelled','failed')"
-            ).fetchone()[0]
-            violations = self._connection.execute(
-                "SELECT COUNT(*) FROM audit_logs WHERE outcome = 'denied'"
-            ).fetchone()[0]
+            active_programmes = self._connection.execute("SELECT COUNT(*) FROM work_items WHERE item_type = 'programme' AND state NOT IN ('completed','cancelled','failed')").fetchone()[0]
+            violations = self._connection.execute("SELECT COUNT(*) FROM audit_logs WHERE outcome = 'denied'").fetchone()[0]
         return {
             "control_plane": "jarvis",
             "active_programmes": active_programmes,

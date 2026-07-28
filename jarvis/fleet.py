@@ -162,10 +162,18 @@ class DaemonManager:
     def get_status(self) -> str:
         state = self.read_state()
         is_installed = LAUNCHD_PLIST_PATH.exists()
-        
-        # Check launchctl list
-        res = subprocess.run(["launchctl", "list", LAUNCHD_LABEL], capture_output=True, text=True)
-        active_in_launchctl = (res.returncode == 0)
+
+        # launchd is macOS-only; status remains inspectable in Linux CI and recovery shells.
+        launchctl = shutil.which("launchctl")
+        if launchctl:
+            res = subprocess.run(
+                [launchctl, "list", LAUNCHD_LABEL],
+                capture_output=True,
+                text=True,
+            )
+            active_in_launchctl = res.returncode == 0
+        else:
+            active_in_launchctl = False
 
         tel = get_mac_telemetry()
         return (

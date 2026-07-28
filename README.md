@@ -10,7 +10,7 @@ JARVIS is also the master control plane for Amaura Studio's governed 15-role AI 
 
 See [docs/AMAURA_STUDIO.md](docs/AMAURA_STUDIO.md) for the operating model, configuration, workflows, and API.
 
-The production expansion includes a 43-employee registry, a 16-stage evidence-governed client-acquisition pipeline, a 12-stage content factory, the founder-approved revenue prompt catalogue, idempotent and approval-gated outbound actions, licence and analytics tracking, prompt-injection controls, kill switches, portable storage, stress tests, and deployable REST surfaces. See [docs/AMAURA_PRODUCTION.md](docs/AMAURA_PRODUCTION.md) for secure configuration, endpoints, verification, and operations.
+The production expansion includes a 43-employee registry, a crash-resumable task supervisor, independent automated review, exact-payload founder approvals, a tamper-evident audit chain, a 16-stage evidence-governed client-acquisition pipeline, a 12-stage content factory, zero-cost Nova/Ollama routing, idempotent outbound controls, kill switches, stress tests, and deployable REST surfaces. See [docs/AMAURA_PRODUCTION.md](docs/AMAURA_PRODUCTION.md) for secure configuration, endpoints, verification, and operations.
 
 ---
 
@@ -25,6 +25,11 @@ export NVIDIA_API_KEY="your-key-here"
 
 # Or with Python directly:
 python -m jarvis
+
+# Advance the internal workforce using local Nova/Ollama
+export AMAURA_MODEL_MODE=local
+export AMAURA_LOCAL_MODEL=nova:3b
+python -m jarvis.amaura.supervisor --drain
 ```
 
 ## 🎙️ Voice Mode

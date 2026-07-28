@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 
 from jarvis.amaura.models import GovernanceError, RiskLevel
@@ -24,26 +25,21 @@ class ModelRoute:
 class ModelGateway:
     """Selects an approved model without exposing restricted data or exceeding budget."""
 
-    def route(
-        self,
-        agent_id: str,
-        *,
-        risk: str = "low",
-        sensitivity: str = "internal",
-        estimated_tokens: int = 4000,
-        remaining_budget_cents: int,
-        needs_vision: bool = False,
-    ) -> ModelRoute:
+    def route(self, agent_id: str, *, risk: str = "low", sensitivity: str = "internal", estimated_tokens: int = 4000, remaining_budget_cents: int, needs_vision: bool = False) -> ModelRoute:
         agent = get_agent(agent_id)
         estimated_tokens = max(1, estimated_tokens)
-        if sensitivity in {"client_confidential", "secret", "restricted"}:
+        mode = os.environ.get("AMAURA_MODEL_MODE", "balanced").strip().lower()
+        if mode not in {"local", "balanced", "cloud"}:
+            raise GovernanceError("AMAURA_MODEL_MODE must be local, balanced, or cloud")
+        restricted = sensitivity in {"client_confidential", "secret", "restricted"}
+        if restricted or mode == "local":
             route = ModelRoute(
                 model_key="ollama-local",
                 provider="local",
                 privacy="device_only",
                 estimated_cost_cents=0,
                 fallback_model_key=None,
-                reason="Restricted data is routed to a local model with no cloud fallback.",
+                reason=("Restricted data is routed to a local model with no cloud fallback." if restricted else "Zero-cost local mode routes work to Nova/Ollama with no cloud fallback."),
             )
         elif needs_vision:
             route = ModelRoute(
@@ -73,7 +69,5 @@ class ModelGateway:
                 reason="Routine work uses the lower-cost general model.",
             )
         if route.estimated_cost_cents > remaining_budget_cents:
-            raise GovernanceError(
-                f"Estimated model cost {route.estimated_cost_cents}c exceeds remaining task budget {remaining_budget_cents}c"
-            )
+            raise GovernanceError(f"Estimated model cost {route.estimated_cost_cents}c exceeds remaining task budget {remaining_budget_cents}c")
         return route

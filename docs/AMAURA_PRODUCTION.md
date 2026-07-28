@@ -7,6 +7,45 @@ This repository now contains one integrated, local-first operating kernel for Am
 
 The five founder-supplied revenue prompts are packaged verbatim, versioned, and loaded into the matching employee definitions. The content and acquisition blueprints are implemented as enforceable workflows and data controls rather than as untrusted runtime instructions.
 
+## Durable supervisor
+
+The workforce is advanced by `AmauraSupervisor`, a SQLite-backed worker that is safe to restart and safe to run from multiple processes:
+
+- it atomically leases only dependency-ready tasks;
+- one active execution is permitted per task;
+- a heartbeat extends the lease while a model or tool is working;
+- expired leases are recovered after a crash;
+- transient provider failures retry once by default;
+- policy, validation, and evidence failures fail closed;
+- employee output stops at `awaiting_review`;
+- a separately registered reviewer verifies the evidence;
+- founder review is never automated.
+
+Run one unit of work, drain all currently safe work, or keep a worker alive:
+
+```bash
+python -m jarvis.amaura.supervisor --once
+python -m jarvis.amaura.supervisor --drain --max-ticks 100
+python -m jarvis.amaura.supervisor --poll-seconds 5
+```
+
+The installed console entry point is `amaura-worker`. `AMAURA_LEASE_SECONDS` and `AMAURA_MAX_ATTEMPTS` tune recovery. The recommended values are 900 seconds and two attempts.
+
+The supervisor can execute internal work and independent reviews. It deliberately stops at founder approvals, public publication, production deployment, pricing commitments, external outreach, payments, and other authority boundaries.
+
+## Zero-cost model mode
+
+Set the following values to route every employee and reviewer to the local Ollama endpoint with no cloud fallback:
+
+```bash
+export AMAURA_MODEL_MODE=local
+export OLLAMA_URL=http://127.0.0.1:11434
+export AMAURA_LOCAL_MODEL=nova:3b
+export AMAURA_LOCAL_REVIEW_MODEL=nova:3b
+```
+
+`nova:3b` must already exist in Ollama under that tag. A different installed local model can be selected without changing code. Restricted or client-confidential data is device-only regardless of the general routing mode.
+
 ## Safety and reliability guarantees
 
 - Public prospect facts require a URL, excerpt, retrieval time, confidence, and content hash.
@@ -20,6 +59,12 @@ The five founder-supplied revenue prompts are packaged verbatim, versioned, and 
 - External communications, public content, pricing, commitments, and releases remain founder-gated.
 - Content assets require hashes. External assets require source and licence records.
 - SQLite uses foreign keys and WAL, has integrity checks, and supports consistent online backups.
+- Execution leases prevent duplicate workers and recover abandoned in-progress tasks.
+- Audit entries form a SHA-256 hash chain so direct database tampering is detectable.
+- Founder approvals expire after 48 hours and are bound to the exact summary, evidence, risk, action, and cost payload reviewed.
+- Task-relative file arguments resolve to the assigned workspace before both policy evaluation and execution.
+- Web fetch policy blocks loopback, private, link-local, reserved, credential-bearing, and metadata-service URLs.
+- Telegram refuses to start without a bound founder user ID; file uploads and exports are path-confined.
 - The acquisition kill switch stops discovery and sending immediately.
 
 ## Configure
@@ -68,6 +113,8 @@ All detailed reads and ordinary mutations use `X-Amaura-Operator-Key`. Founder d
 GET  /api/amaura/readiness
 GET  /api/amaura/dashboard
 POST /api/amaura/programmes
+GET  /api/amaura/supervisor/status
+POST /api/amaura/supervisor/tick
 
 GET  /api/amaura/revenue
 POST /api/amaura/revenue/campaigns
@@ -101,6 +148,8 @@ python -m build --wheel --no-isolation
 ```
 
 The readiness endpoint intentionally reports missing optional adapters. PydanticAI, LangGraph, DBOS, LiteLLM, MCP/OPA, OpenSandbox, Langfuse, Promptfoo, FFmpeg, OBS, Ollama, Gmail, Telegram, and publishing platforms are not claimed as active unless actually installed and configured. The core kernel runs without them; they extend execution, observability, media rendering, or external delivery.
+
+The local supervisor now supplies the core durability previously delegated to DBOS/LangGraph: dependency scheduling, atomic leases, heartbeats, recovery, retries, review routing, and persisted state. External packages remain optional adapters rather than false prerequisites. Host command execution is still process-level isolation, not a substitute for OpenSandbox or a locked-down container; use a disposable repository workspace and Docker/OpenSandbox before allowing untrusted repositories to execute tests.
 
 ## Backup and recovery
 

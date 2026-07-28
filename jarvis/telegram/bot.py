@@ -25,6 +25,12 @@ def start_telegram_bot(agent):
         return
 
     allowed_user_id = os.environ.get("TELEGRAM_USER_ID", "")
+    if not allowed_user_id:
+        ui.print_error(
+            "TELEGRAM_USER_ID must be configured before the private control bot can start. "
+            "This fail-closed rule prevents an unbound bot token from exposing JARVIS."
+        )
+        return
 
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -116,9 +122,11 @@ def start_telegram_bot(agent):
         doc = update.message.document
         file = await context.bot.get_file(doc.file_id)
 
-        save_dir = Path.home() / "Desktop" / "jarvis_uploads"
-        save_dir.mkdir(exist_ok=True)
-        save_path = save_dir / doc.file_name
+        from jarvis.paths import get_data_dir
+        save_dir = get_data_dir() / "telegram_uploads"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(doc.file_name or "telegram-upload").name
+        save_path = save_dir / safe_name
 
         await file.download_to_drive(str(save_path))
         ui.print_info(f"[Telegram] Saved file: {save_path}")
@@ -255,7 +263,7 @@ def start_telegram_bot(agent):
 def _is_authorized(update, allowed_user_id: str) -> bool:
     """Check if the message sender is authorized."""
     if not allowed_user_id:
-        return True  # No restriction set
+        return False
     return str(update.message.from_user.id) == allowed_user_id
 
 
@@ -310,10 +318,23 @@ async def _send_generated_files(update, response: str):
     # Look for file paths in the response
     paths = re.findall(r'(?:saved to|created:|wrote to)\s+([/~][\w/._-]+)', response, re.IGNORECASE)
     for p in paths:
-        path = os.path.expanduser(p.strip())
-        if os.path.exists(path) and os.path.isfile(path):
+        path = Path(os.path.expanduser(p.strip())).resolve()
+        if _is_exportable_path(path) and path.is_file():
             try:
-                await update.message.reply_document(document=open(path, 'rb'))
+                with path.open("rb") as document:
+                    await update.message.reply_document(document=document)
             except Exception as e:
                 import logging
                 logging.error(f"Failed to send file {path}: {e}")
+
+
+def _is_exportable_path(path: Path) -> bool:
+    """Prevent model-authored text from exfiltrating arbitrary host files."""
+    from jarvis.paths import get_data_dir
+    configured = [
+        Path(item).expanduser().resolve()
+        for item in os.environ.get("JARVIS_FILE_EXPORT_ROOTS", "").split(os.pathsep)
+        if item.strip()
+    ]
+    roots = [Path.cwd().resolve(), get_data_dir().resolve(), *configured]
+    return any(path == root or root in path.parents for root in roots)

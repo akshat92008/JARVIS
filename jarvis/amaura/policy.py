@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from jarvis.amaura.models import GovernanceError, PolicyDecision, RISK_ORDER, RiskLevel
+from jarvis.amaura.models import RISK_ORDER, GovernanceError, PolicyDecision, RiskLevel
 from jarvis.amaura.registry import get_agent
-
 
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+-]{16,}", re.I),
+    re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+-]{16,}", re.IGNORECASE),
 )
 
 EXTERNAL_ACTIONS = {
-    "external_proposal", "client_commitment", "public_content", "public_publish",
-    "production_deployment", "model_release", "payment", "refund", "contract_acceptance",
+    "external_proposal",
+    "client_commitment",
+    "public_content",
+    "public_publish",
+    "production_deployment",
+    "model_release",
+    "payment",
+    "refund",
+    "contract_acceptance",
     "external_outreach",
 }
 
@@ -39,15 +47,54 @@ def tool_risk_class(tool_name: str) -> str:
             return risk_class
     return "R2"
 
+
 PATH_ARGUMENTS = {"path", "file_path", "directory", "cwd", "repo_path", "project_path", "output_path"}
+SHELL_METACHARACTERS = re.compile(r"[;&|><`\n\r]|\$")
+SHELL_BACKED_ARGUMENTS = {"run_tests": {"framework", "filter"}, "lint_code": {"linter"}, "git_diff": {"target"}}
 SAFE_COMMAND_PREFIXES = (
-    ("pytest",), ("python", "-m", "pytest"), ("python3", "-m", "pytest"),
-    ("ruff",), ("mypy",), ("tsc",), ("rg",), ("ls",),
-    ("git", "status"), ("git", "diff"), ("git", "log"),
-    ("npm", "test"), ("npm", "run", "test"), ("npm", "run", "build"), ("npm", "run", "lint"),
-    ("pnpm", "test"), ("pnpm", "build"), ("pnpm", "lint"),
-    ("cargo", "test"), ("cargo", "check"), ("go", "test"),
+    ("pytest",),
+    ("python", "-m", "pytest"),
+    ("python3", "-m", "pytest"),
+    ("ruff",),
+    ("mypy",),
+    ("tsc",),
+    ("rg",),
+    ("ls",),
+    ("git", "status"),
+    ("git", "diff"),
+    ("git", "log"),
+    ("npm", "test"),
+    ("npm", "run", "test"),
+    ("npm", "run", "build"),
+    ("npm", "run", "lint"),
+    ("pnpm", "test"),
+    ("pnpm", "build"),
+    ("pnpm", "lint"),
+    ("cargo", "test"),
+    ("cargo", "check"),
+    ("go", "test"),
 )
+
+
+def _public_http_url(url: str) -> tuple[bool, str]:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False, "Malformed URL"
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False, "Only absolute HTTP(S) URLs are allowed"
+    if parsed.username or parsed.password:
+        return False, "URLs containing credentials are not allowed"
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal")) or hostname in {"metadata.google.internal", "metadata.aws.internal"}:
+        return False, "Local and metadata-service hosts are blocked"
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True, ""
+    if not address.is_global:
+        return (False, "Private, loopback, link-local, and reserved network addresses are blocked")
+    return True, ""
 
 
 class PolicyEngine:
@@ -61,9 +108,7 @@ class PolicyEngine:
         if RISK_ORDER[risk] > RISK_ORDER[agent.max_risk]:
             reasons.append(f"{agent.name} may not own {risk.value}-risk work")
         if task["budget_cents"] > agent.cost_limit_cents:
-            reasons.append(
-                f"Task budget {task['budget_cents']}c exceeds {agent.name}'s {agent.cost_limit_cents}c limit"
-            )
+            reasons.append(f"Task budget {task['budget_cents']}c exceeds {agent.name}'s {agent.cost_limit_cents}c limit")
         if task.get("reviewer_id") == task["owner_id"]:
             reasons.append("No agent may review its own work")
         return PolicyDecision(allowed=not reasons, reasons=tuple(reasons))
@@ -88,15 +133,34 @@ class PolicyEngine:
         for key, raw_value in args.items():
             if key not in PATH_ARGUMENTS or not isinstance(raw_value, str) or not raw_value:
                 continue
+            if SHELL_METACHARACTERS.search(raw_value):
+                reasons.append(f"Path argument '{key}' contains unsafe shell characters")
+                continue
             candidate = Path(raw_value).expanduser()
             if not candidate.is_absolute():
                 candidate = workspace / candidate
             candidate = candidate.resolve()
             if candidate != workspace and workspace not in candidate.parents:
                 reasons.append(f"Path argument '{key}' escapes the assigned workspace")
+        if tool_name == "web_fetch":
+            safe_url, url_reason = _public_http_url(str(args.get("url", "")))
+            if not safe_url:
+                reasons.append(f"Web fetch blocked: {url_reason}")
+        for argument in SHELL_BACKED_ARGUMENTS.get(tool_name, set()):
+            value = args.get(argument)
+            if isinstance(value, str) and SHELL_METACHARACTERS.search(value):
+                reasons.append(f"Shell-backed argument '{argument}' contains unsafe characters")
+        if tool_name == "run_tests":
+            framework = str(args.get("framework", "")).strip()
+            if framework and framework not in {"pytest", "unittest", "jest", "vitest", "mocha", "go", "cargo", "rspec", "phpunit"}:
+                reasons.append("Test framework is outside the governed allowlist")
+        if tool_name == "git_diff":
+            target = str(args.get("target", "")).strip()
+            if target.startswith("-") or (target and not re.fullmatch(r"[A-Za-z0-9_./~^:@{}+-]+", target)):
+                reasons.append("Git diff target is not a safe revision")
         if tool_name == "run_command":
             command = str(args.get("command", "")).strip()
-            if re.search(r"[;&|><`\n\r]", command) or "$" in command:
+            if SHELL_METACHARACTERS.search(command):
                 reasons.append("Shell operators, substitutions, and redirections are not allowed for company employees")
             try:
                 tokens = tuple(shlex.split(command))
@@ -105,7 +169,7 @@ class PolicyEngine:
                 reasons.append("Command could not be parsed safely")
             if not tokens:
                 reasons.append("Empty commands are not allowed")
-            elif not any(tokens[:len(prefix)] == prefix for prefix in SAFE_COMMAND_PREFIXES):
+            elif not any(tokens[: len(prefix)] == prefix for prefix in SAFE_COMMAND_PREFIXES):
                 reasons.append("Command is outside the governed test/build/read-only allowlist")
         risk = RiskLevel(task["risk"])
         manual = risk is RiskLevel.CRITICAL or risk_class == "R4"
@@ -128,8 +192,7 @@ class PolicyEngine:
             reasons.append("No external claim or commitment may proceed without evidence")
         return PolicyDecision(
             allowed=not reasons,
-            requires_approval=risk in {RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL}
-            or task["action_type"] in EXTERNAL_ACTIONS,
+            requires_approval=risk in {RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL} or task["action_type"] in EXTERNAL_ACTIONS,
             manual_execution=risk is RiskLevel.CRITICAL,
             reasons=tuple(reasons),
         )

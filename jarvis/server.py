@@ -133,6 +133,10 @@ class AmauraProgrammeRequest(BaseModel):
 class AmauraRunRequest(BaseModel):
     max_iterations: int = 12
 
+class AmauraSupervisorRequest(BaseModel):
+    workflow_id: str = ""
+    automatic_reviews: bool = True
+
 class AmauraReviewRequest(BaseModel):
     reviewer_id: str
     approve: bool
@@ -228,10 +232,12 @@ class AmauraContentMetricsRequest(BaseModel):
 AMAURA_MUTATING_TOOLS = {
     "amaura_create_program", "amaura_run_task", "amaura_review_task", "amaura_record_decision", "amaura_pause_agent",
     "amaura_create_campaign", "amaura_discover_lead", "amaura_score_lead",
+    "amaura_supervisor_tick",
 }
 AMAURA_PROTECTED_TOOLS = AMAURA_MUTATING_TOOLS | {
     "amaura_list_agents", "amaura_list_tasks", "amaura_task_packet",
     "amaura_pending_approvals", "amaura_daily_briefing", "amaura_revenue_dashboard",
+    "amaura_supervisor_status",
 }
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
@@ -451,8 +457,9 @@ def _require_amaura_key(environment_name: str, supplied: str, authority: str) ->
 
 
 @app.get("/api/amaura/dashboard")
-async def amaura_dashboard():
+async def amaura_dashboard(operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     """Executive company dashboard governed by JARVIS."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     return _amaura_control().dashboard()
 
 
@@ -518,6 +525,38 @@ async def amaura_run_task(
     from jarvis.amaura.executor import GovernedTaskRunner
     try:
         return await asyncio.to_thread(GovernedTaskRunner(_amaura_control()).run, task_id, req.max_iterations)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/amaura/supervisor/status")
+async def amaura_supervisor_status(
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
+    """Return durable worker leases, queue depth, and approval boundaries."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    from jarvis.amaura.supervisor import AmauraSupervisor
+    return AmauraSupervisor(_amaura_control(), worker_id="jarvis-api").status()
+
+
+@app.post("/api/amaura/supervisor/tick")
+async def amaura_supervisor_tick(
+    req: AmauraSupervisorRequest,
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
+    """Advance one crash-resumable execution or independent review."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    from jarvis.amaura.supervisor import AmauraSupervisor
+    supervisor = AmauraSupervisor(
+        _amaura_control(),
+        worker_id="jarvis-api",
+        automatic_reviews=req.automatic_reviews,
+    )
+    try:
+        return await asyncio.to_thread(
+            supervisor.tick,
+            workflow_id=req.workflow_id or None,
+        )
     except (KeyError, ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
