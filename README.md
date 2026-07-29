@@ -10,7 +10,7 @@ JARVIS is also the master control plane for Amaura Studio's governed 15-role AI 
 
 See [docs/AMAURA_STUDIO.md](docs/AMAURA_STUDIO.md) for the operating model, configuration, workflows, and API.
 
-The production expansion includes a 43-employee registry, a crash-resumable task supervisor, independent automated review, exact-payload founder approvals, a tamper-evident audit chain, a 16-stage evidence-governed client-acquisition pipeline, a 12-stage content factory, zero-cost Nova/Ollama routing, idempotent outbound controls, kill switches, stress tests, and deployable REST surfaces. See [docs/AMAURA_PRODUCTION.md](docs/AMAURA_PRODUCTION.md) for secure configuration, endpoints, verification, and operations.
+The production expansion includes a 43-employee registry, a crash-resumable task supervisor, distinct-model signed review, a content-addressed evidence vault, exact-payload founder approvals, a tamper-evident audit chain, Docker-isolated execution, provider-signed Gmail/private-draft adapters, durable telemetry, a 16-stage client-acquisition pipeline, a 12-stage content factory, zero-cost local routing, stress tests, CI, and a fail-closed release gate. See [docs/AMAURA_PRODUCTION.md](docs/AMAURA_PRODUCTION.md) for secure configuration, endpoints, verification, and operations.
 
 ---
 
@@ -29,6 +29,7 @@ python -m jarvis
 # Advance the internal workforce using local Nova/Ollama
 export AMAURA_MODEL_MODE=local
 export AMAURA_LOCAL_MODEL=nova:3b
+export AMAURA_LOCAL_REVIEW_MODEL=qwen2.5-coder:3b
 python -m jarvis.amaura.supervisor --drain
 ```
 
@@ -47,7 +48,7 @@ python -m jarvis --voice
 ```bash
 # 1. Message @BotFather on Telegram → /newbot → copy the token
 export TELEGRAM_BOT_TOKEN="your-token"
-export TELEGRAM_USER_ID="your-telegram-id"   # optional, for security
+export TELEGRAM_USER_ID="your-telegram-id"   # required; bot fails closed without it
 
 # 2. Start the bot
 python -m jarvis --telegram

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from jarvis.amaura.control_plane import AmauraControlPlane
-from jarvis.amaura.models import GovernanceError
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from jarvis.amaura.control_plane import AmauraControlPlane  # noqa: E402
+from jarvis.amaura.integrations import ProviderReceipt  # noqa: E402
+from jarvis.amaura.models import GovernanceError  # noqa: E402
 
 CAMPAIGNS = 20
 LEADS_PER_CAMPAIGN = 50
@@ -19,6 +25,11 @@ OUTREACH = """Hi Maya, I noticed this agency publicly lists branding, search, an
 
 
 def main() -> int:
+    os.environ.setdefault(
+        "AMAURA_PROVIDER_RECEIPT_KEY",
+        "stress-provider-receipt-key-32-bytes-minimum",
+    )
+    os.environ["AMAURA_DISABLE_CLOUD"] = "1"
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="amaura-stress-") as directory:
         control = AmauraControlPlane(Path(directory) / "amaura.db")
@@ -65,7 +76,7 @@ def main() -> int:
             by_campaign.setdefault(lead["campaign_id"], []).append(lead)
 
         outbound: list[dict] = []
-        for campaign_id, campaign_leads in by_campaign.items():
+        for _campaign_id, campaign_leads in by_campaign.items():
             for lead in campaign_leads[:4]:
                 message = pipeline.stage_message(
                     lead["id"], channel="public_email", message_type="first_contact",
@@ -77,7 +88,16 @@ def main() -> int:
         def send(message: dict) -> bool:
             try:
                 pipeline.confirm_external_send(
-                    message["id"], external_message_id=f"provider-{message['id']}", actor="stress",
+                    message["id"],
+                    provider_receipt=ProviderReceipt.issue(
+                        provider="gmail",
+                        operation="send_email",
+                        external_id=f"provider-{message['id']}",
+                        idempotency_key=message["idempotency_key"],
+                        payload={"stress": True},
+                        status="sent",
+                    ),
+                    actor="stress",
                 )
                 return True
             except GovernanceError as exc:

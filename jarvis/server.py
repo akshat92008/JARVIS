@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -79,7 +79,10 @@ async def protect_general_mutations(request: Request, call_next):
     if request.method != "GET" and path.startswith("/api/amaura"):
         founder_surface = (
             (path.startswith("/api/amaura/approvals/") and path != "/api/amaura/approvals/")
-            or path.endswith("/decision") or path.endswith("/kill-switch")
+            or path.endswith("/decision")
+            or path.endswith("/kill-switch")
+            or path.endswith("/deliver")
+            or path.endswith("/private-draft")
         )
         environment_name = "AMAURA_APPROVAL_KEY" if founder_surface else "AMAURA_OPERATOR_KEY"
         header_name = "X-Amaura-Approval-Key" if founder_surface else "X-Amaura-Operator-Key"
@@ -197,8 +200,13 @@ class AmauraMessageDecisionRequest(BaseModel):
     reason: str
 
 class AmauraSendConfirmationRequest(BaseModel):
-    external_message_id: str
+    provider_receipt: dict = {}
+    external_message_id: str = ""
     thread_id: str = ""
+    actor: str = "jarvis"
+
+class AmauraDeliverMessageRequest(BaseModel):
+    recipient: str
     actor: str = "jarvis"
 
 class AmauraKillSwitchRequest(BaseModel):
@@ -227,6 +235,10 @@ class AmauraContentMetricsRequest(BaseModel):
     window: str
     metrics: dict[str, float]
     captured_at: str = ""
+
+class AmauraPrivatePublicationRequest(BaseModel):
+    payload: dict
+    idempotency_key: str
 
 
 AMAURA_MUTATING_TOOLS = {
@@ -633,6 +645,27 @@ async def amaura_readiness(operator_key: str = Header(default="", alias="X-Amaur
     return _amaura_control().production_readiness()
 
 
+@app.get("/api/amaura/telemetry")
+async def amaura_telemetry(
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
+    """Return durable operational metrics, traces, and open alerts."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    return _amaura_control().telemetry.snapshot()
+
+
+@app.get("/api/amaura/metrics", response_class=PlainTextResponse)
+async def amaura_prometheus_metrics(
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
+    """Render durable Amaura metrics in Prometheus text format."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    return PlainTextResponse(
+        _amaura_control().telemetry.prometheus(),
+        media_type="text/plain; version=0.0.4",
+    )
+
+
 # -- Revenue pipeline ----------------------------------------------------------
 
 @app.get("/api/amaura/revenue")
@@ -717,7 +750,29 @@ async def amaura_confirm_pipeline_send(message_id: str, req: AmauraSendConfirmat
                                        operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.confirm_external_send(message_id, **req.model_dump())
+        values = req.model_dump()
+        values["provider_receipt"] = values["provider_receipt"] or None
+        return _amaura_control().acquisition.confirm_external_send(
+            message_id,
+            **values,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/amaura/revenue/messages/{message_id}/deliver")
+async def amaura_deliver_pipeline_message(
+    message_id: str,
+    req: AmauraDeliverMessageRequest,
+    approval_key: str = Header(default="", alias="X-Amaura-Approval-Key"),
+):
+    """Deliver an approved message through Gmail and persist its signed receipt."""
+    _require_amaura_key("AMAURA_APPROVAL_KEY", approval_key, "founder approval")
+    try:
+        return _amaura_control().acquisition.deliver_approved_message(
+            message_id,
+            **req.model_dump(),
+        )
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -771,6 +826,39 @@ async def amaura_record_content_metrics(campaign_id: str, req: AmauraContentMetr
         return _amaura_control().content_factory.record_metrics(campaign_id, **data)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/amaura/content/campaigns/{campaign_id}/private-draft")
+async def amaura_create_private_publication_draft(
+    campaign_id: str,
+    req: AmauraPrivatePublicationRequest,
+    approval_key: str = Header(default="", alias="X-Amaura-Approval-Key"),
+):
+    """Create a provider-confirmed private draft; this endpoint never publishes."""
+    _require_amaura_key("AMAURA_APPROVAL_KEY", approval_key, "founder approval")
+    control = _amaura_control()
+    readiness = control.content_factory.publication_readiness(campaign_id)
+    if not readiness["ready"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Content campaign has not passed publication readiness",
+        )
+    from jarvis.amaura.integrations import PrivatePublicationAdapter
+
+    try:
+        receipt = PrivatePublicationAdapter().create_private_draft(
+            payload=req.payload,
+            idempotency_key=req.idempotency_key,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    control.store.record_idempotency(
+        req.idempotency_key,
+        "create_private_publication_draft",
+        receipt.external_id,
+        receipt.payload_sha256,
+    )
+    return {"campaign_id": campaign_id, "receipt": receipt.to_dict()}
 
 
 # ── WebSocket — Streaming Chat ─────────────────────────────────────────────────

@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import re
 import shlex
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from jarvis.amaura.models import RISK_ORDER, GovernanceError, PolicyDecision, RiskLevel
+from jarvis.amaura.network import validate_public_url
 from jarvis.amaura.registry import get_agent
 
 SECRET_PATTERNS = (
@@ -33,7 +32,15 @@ EXTERNAL_ACTIONS = {
 }
 
 TOOL_RISK_CLASSES = {
-    "R0": {"read_file", "search_code", "find_files", "get_project_structure", "vector_search", "query_symbols"},
+    "R0": {
+        "read_file",
+        "search_code",
+        "find_files",
+        "get_project_structure",
+        "recall_memory",
+        "search_project_memory",
+        "search_symbol",
+    },
     "R1": {"web_search", "web_fetch", "read_pdf"},
     "R2": {"write_file", "edit_file", "create_document", "create_presentation", "run_command", "run_tests"},
     "R3": {"send_email", "send_message", "schedule_post", "publish_content", "create_gmail_draft"},
@@ -48,7 +55,16 @@ def tool_risk_class(tool_name: str) -> str:
     return "R2"
 
 
-PATH_ARGUMENTS = {"path", "file_path", "directory", "cwd", "repo_path", "project_path", "output_path"}
+PATH_ARGUMENTS = {
+    "path",
+    "file_path",
+    "directory",
+    "cwd",
+    "repo_path",
+    "root_dir",
+    "project_path",
+    "output_path",
+}
 SHELL_METACHARACTERS = re.compile(r"[;&|><`\n\r]|\$")
 SHELL_BACKED_ARGUMENTS = {"run_tests": {"framework", "filter"}, "lint_code": {"linter"}, "git_diff": {"target"}}
 SAFE_COMMAND_PREFIXES = (
@@ -78,23 +94,11 @@ SAFE_COMMAND_PREFIXES = (
 
 def _public_http_url(url: str) -> tuple[bool, str]:
     try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return False, "Malformed URL"
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False, "Only absolute HTTP(S) URLs are allowed"
-    if parsed.username or parsed.password:
-        return False, "URLs containing credentials are not allowed"
-    hostname = parsed.hostname.rstrip(".").lower()
-    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal")) or hostname in {"metadata.google.internal", "metadata.aws.internal"}:
-        return False, "Local and metadata-service hosts are blocked"
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
+        validate_public_url(url, resolve=False)
+    except GovernanceError as exc:
+        return False, str(exc)
+    else:
         return True, ""
-    if not address.is_global:
-        return (False, "Private, loopback, link-local, and reserved network addresses are blocked")
-    return True, ""
 
 
 class PolicyEngine:
@@ -154,6 +158,16 @@ class PolicyEngine:
             framework = str(args.get("framework", "")).strip()
             if framework and framework not in {"pytest", "unittest", "jest", "vitest", "mocha", "go", "cargo", "rspec", "phpunit"}:
                 reasons.append("Test framework is outside the governed allowlist")
+        if tool_name == "lint_code":
+            linter = str(args.get("linter", "")).strip()
+            if linter and linter not in {
+                "ruff",
+                "flake8",
+                "eslint",
+                "golangci-lint",
+                "clippy",
+            }:
+                reasons.append("Linter is outside the governed allowlist")
         if tool_name == "git_diff":
             target = str(args.get("target", "")).strip()
             if target.startswith("-") or (target and not re.fullmatch(r"[A-Za-z0-9_./~^:@{}+-]+", target)):

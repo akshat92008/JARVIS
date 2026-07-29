@@ -1,9 +1,6 @@
 {
-  "nvidia_api_key": "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",
-  "nvidia_api_keys": [
-    "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",
-    "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"
-  ],
+  "nvidia_api_key": "",
+  "nvidia_api_keys": [],
   "default_provider": "auto",
   "max_thinking_budget": 8000,
   "auto_self_heal": true,

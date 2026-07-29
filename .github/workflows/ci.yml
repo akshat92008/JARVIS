@@ -1,0 +1,67 @@
+name: release-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      AMAURA_MODEL_MODE: local
+      AMAURA_LOCAL_MODEL: nova-worker-test
+      AMAURA_LOCAL_REVIEW_MODEL: nova-reviewer-test
+      AMAURA_SANDBOX_MODE: docker
+      AMAURA_DISABLE_CLOUD: "1"
+      NVIDIA_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Unit and contract tests
+        run: python -m pytest -q
+      - name: Lint
+        run: ruff check jarvis/amaura scripts tests/test_amaura_production.py tests/test_amaura_contract.py
+      - name: Types
+        run: >-
+          mypy
+          jarvis/amaura/capabilities.py
+          jarvis/amaura/content_factory.py
+          jarvis/amaura/control_plane.py
+          jarvis/amaura/evaluation.py
+          jarvis/amaura/evidence.py
+          jarvis/amaura/executor.py
+          jarvis/amaura/integrations.py
+          jarvis/amaura/model_gateway.py
+          jarvis/amaura/models.py
+          jarvis/amaura/network.py
+          jarvis/amaura/pipeline.py
+          jarvis/amaura/policy.py
+          jarvis/amaura/readiness.py
+          jarvis/amaura/sandbox.py
+          jarvis/amaura/security.py
+          jarvis/amaura/store.py
+          jarvis/amaura/supervisor.py
+          jarvis/amaura/telemetry.py
+      - name: Static production gate
+        run: python scripts/release_gate.py --static-only
+      - name: Adversarial stress
+        run: python scripts/stress_amaura.py
+      - name: Build wheel
+        run: python -m build --wheel

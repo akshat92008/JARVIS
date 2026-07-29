@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 from jarvis.amaura.models import GovernanceError
 from jarvis.amaura.store import CompanyStore
 
-
 REQUIRED_PUBLICATION_ASSETS = {"master", "claim_map", "licence_inventory", "qa_report", "metadata"}
 MEASUREMENT_WINDOWS = {"24h", "72h", "7d", "30d"}
 

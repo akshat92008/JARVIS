@@ -6,9 +6,11 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from jarvis.amaura.content_factory import REQUIRED_PUBLICATION_ASSETS
 from jarvis.amaura.control_plane import AmauraControlPlane
+from jarvis.amaura.integrations import ProviderReceipt
 from jarvis.amaura.models import GovernanceError
 from jarvis.amaura.pipeline import SCORE_LIMITS
 from jarvis.amaura.prompts import load_prompt_catalogue
@@ -114,11 +116,42 @@ class TestAmauraGrowthSystem(unittest.TestCase):
             message["id"], actor=self.control.founder_id, approve=True, reason="Evidence checked",
         )
         self.assertEqual(approved["status"], "approved")
-        with self.assertRaisesRegex(GovernanceError, "provider message identifier"):
-            self.pipeline.confirm_external_send(message["id"], external_message_id="", actor="jarvis")
-        sent = self.pipeline.confirm_external_send(message["id"], external_message_id="gmail-123", actor="jarvis")
-        self.assertEqual(sent["status"], "sent")
-        self.assertEqual(self.pipeline.confirm_external_send(message["id"], external_message_id="gmail-123", actor="jarvis")["id"], sent["id"])
+        with self.assertRaisesRegex(GovernanceError, "signed provider receipt"):
+            self.pipeline.confirm_external_send(
+                message["id"],
+                external_message_id="gmail-123",
+                actor="jarvis",
+            )
+        with patch.dict(
+            "os.environ",
+            {
+                "AMAURA_PROVIDER_RECEIPT_KEY": (
+                    "test-provider-receipt-key-with-at-least-32-bytes"
+                )
+            },
+        ):
+            receipt = ProviderReceipt.issue(
+                provider="gmail",
+                operation="send_email",
+                external_id="gmail-123",
+                idempotency_key=message["idempotency_key"],
+                payload={"test": True},
+                status="sent",
+            )
+            sent = self.pipeline.confirm_external_send(
+                message["id"],
+                provider_receipt=receipt,
+                actor="jarvis",
+            )
+            self.assertEqual(sent["status"], "sent")
+            self.assertEqual(
+                self.pipeline.confirm_external_send(
+                    message["id"],
+                    provider_receipt=receipt,
+                    actor="jarvis",
+                )["id"],
+                sent["id"],
+            )
 
     def test_opt_out_and_kill_switch_are_immediate(self):
         lead = self._qualified_lead()

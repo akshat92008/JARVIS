@@ -9,14 +9,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
-
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -30,7 +28,6 @@ from jarvis.amaura.policy import EXTERNAL_ACTIONS, SAFE_COMMAND_PREFIXES, TOOL_R
 from jarvis.amaura.readiness import INTEGRATIONS  # noqa: E402
 from jarvis.amaura.registry import ALL_AGENTS  # noqa: E402
 from jarvis.amaura.workflows import WORKFLOWS  # noqa: E402
-
 
 OUT_MD = ROOT / "docs" / "AMAURA_AI_SYSTEM_HANDBOOK.md"
 OUT_DOCX = ROOT / "docs" / "AMAURA_AI_SYSTEM_HANDBOOK.docx"
@@ -47,7 +44,9 @@ def inline_list(values) -> str:
 
 
 def table(headers: list[str], rows: list[list[str]]) -> list[str]:
-    clean = lambda value: str(value).replace("\n", "<br>").replace("|", "\\|")
+    def clean(value: object) -> str:
+        return str(value).replace("\n", "<br>").replace("|", "\\|")
+
     lines = ["| " + " | ".join(clean(h) for h in headers) + " |"]
     lines.append("| " + " | ".join("---" for _ in headers) + " |")
     lines.extend("| " + " | ".join(clean(v) for v in row) + " |" for row in rows)

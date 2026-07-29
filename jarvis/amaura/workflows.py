@@ -2,7 +2,6 @@
 
 from jarvis.amaura.models import RiskLevel, WorkflowStep, WorkflowTemplate
 
-
 WORKFLOWS: dict[str, WorkflowTemplate] = {
     "client_acquisition": WorkflowTemplate(
         key="client_acquisition",

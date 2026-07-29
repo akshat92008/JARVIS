@@ -51,3 +51,4 @@ yarn-error.log*
 # Database / local dynamic storage
 *.sqlite
 *.db
+.jarvis-data/

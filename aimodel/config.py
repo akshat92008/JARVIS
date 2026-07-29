@@ -25,7 +25,11 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 user_conf = json.load(f)
-                config.update(user_conf)
+                for key, value in user_conf.items():
+                    # Empty tracked placeholders must not shadow runtime secrets.
+                    if key.endswith("_api_key") and not value:
+                        continue
+                    config[key] = value
         except Exception as e:
             print(f"[Warning] Failed to read config.json: {e}")
     return config

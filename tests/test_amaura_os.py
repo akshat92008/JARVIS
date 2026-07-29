@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.executor import GovernedTaskRunner
@@ -234,13 +233,15 @@ class TestAmauraCompanyOS(unittest.TestCase):
             ))]
         )
         fake_client = SimpleNamespace(chat_sync=lambda **kwargs: fake_response)
-        with patch("jarvis.api.NvidiaClient", return_value=fake_client):
-            execution = GovernedTaskRunner(self.control).run(task["id"])
+        execution = GovernedTaskRunner(
+            self.control,
+            client_factory=lambda route, employee: fake_client,
+        ).run(task["id"])
 
         self.assertEqual(execution["employee"], "Product Manager")
         self.assertEqual(execution["status"], TaskState.AWAITING_REVIEW.value)
         stored = self.control.store.get_work_item(task["id"])
-        self.assertGreater(stored["spent_cents"], 0)
+        self.assertEqual(stored["spent_cents"], 0)
         self.assertNotEqual(stored["owner_id"], stored["reviewer_id"])
 
 

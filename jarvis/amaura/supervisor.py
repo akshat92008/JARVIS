@@ -57,10 +57,19 @@ class AmauraSupervisor:
             "awaiting_approval": len(
                 self.control.list_tasks(TaskState.AWAITING_APPROVAL.value)
             ),
+            "open_alerts": len(self.control.store.list_alerts(status="open")),
         }
 
     def tick(self, *, workflow_id: str | None = None) -> dict[str, Any]:
         """Advance exactly one review or execution and return an auditable outcome."""
+        with self.control.telemetry.trace(
+            "supervisor.tick",
+            worker_id=self.worker_id,
+            workflow_id=workflow_id or "",
+        ):
+            return self._tick(workflow_id=workflow_id)
+
+    def _tick(self, *, workflow_id: str | None = None) -> dict[str, Any]:
         recovered = self.control.store.recover_expired_executions(
             max_attempts=self.max_attempts
         )
@@ -69,6 +78,13 @@ class AmauraSupervisor:
                 "execution.recovered",
                 item["run_id"],
                 item,
+            )
+            self.control.telemetry.alert(
+                severity="warning",
+                code="execution_lease_recovered",
+                message="An abandoned employee execution lease was recovered.",
+                resource_id=item["run_id"],
+                details=item,
             )
             self.control.store.audit(
                 "jarvis",
@@ -102,6 +118,13 @@ class AmauraSupervisor:
                         task["id"],
                         "deferred",
                         {"error": str(exc)[:2000]},
+                    )
+                    self.control.telemetry.alert(
+                        severity="critical",
+                        code="automatic_review_deferred",
+                        message="Independent automated review failed closed.",
+                        resource_id=task["id"],
+                        details={"error_type": type(exc).__name__},
                     )
                     return {
                         "status": "review_deferred",
@@ -161,6 +184,10 @@ class AmauraSupervisor:
                 run["id"],
                 {"task_id": task["id"], "state": result["status"]},
             )
+            self.control.telemetry.increment(
+                "amaura_execution_total",
+                labels={"outcome": "succeeded"},
+            )
             return {
                 "status": "executed",
                 "recovered": recovered,
@@ -195,11 +222,30 @@ class AmauraSupervisor:
                 "failed",
                 {"retryable": retryable, "error": str(exc)[:2000]},
             )
-            return {
-                "status": "retry_scheduled"
+            outcome = (
+                "retry_scheduled"
                 if self.control.store.get_work_item(task["id"])["state"]
                 == TaskState.ASSIGNED.value
-                else "failed",
+                else "failed"
+            )
+            self.control.telemetry.increment(
+                "amaura_execution_total",
+                labels={"outcome": outcome},
+            )
+            self.control.telemetry.alert(
+                severity="warning" if retryable else "critical",
+                code="employee_execution_failed",
+                message="An employee execution failed inside the governed supervisor.",
+                resource_id=task["id"],
+                details={
+                    "run_id": run["id"],
+                    "attempt": run["attempt"],
+                    "retryable": retryable,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            return {
+                "status": outcome,
                 "recovered": recovered,
                 "execution": execution,
                 "task_id": task["id"],

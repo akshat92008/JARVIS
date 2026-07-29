@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import shlex
-import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
 
 from jarvis.amaura.control_plane import AmauraControlPlane
+from jarvis.amaura.evidence import (
+    create_review_attestation,
+    deterministic_evidence_review,
+)
 from jarvis.amaura.models import GovernanceError, TaskState
+from jarvis.amaura.network import fetch_public_text
 from jarvis.amaura.policy import PATH_ARGUMENTS
 from jarvis.amaura.registry import get_agent
+from jarvis.amaura.sandbox import run_governed_command
 from jarvis.models import DEFAULT_MODEL, MODELS, resolve_model
 
 
@@ -51,8 +55,8 @@ class GovernedTaskRunner:
         "git_status": "cwd",
         "git_diff": "cwd",
         "git_log": "cwd",
-        "index_repository": "repo_path",
-        "query_symbols": "repo_path",
+        "index_codebase_ast": "root_dir",
+        "search_symbol": "root_dir",
     }
 
     def __init__(self, control_plane: AmauraControlPlane, client_factory=None):
@@ -64,6 +68,10 @@ class GovernedTaskRunner:
             return self.client_factory(route, employee)
         if route["provider"] == "local":
             return _LocalOllamaClient()
+        if os.environ.get("AMAURA_DISABLE_CLOUD") == "1":
+            raise GovernanceError(
+                "Cloud model access is disabled for this execution"
+            )
         from jarvis.api import NvidiaClient
 
         agent_key = os.getenv(f"NVIDIA_API_KEY_{employee.agent_id.upper()}")
@@ -86,19 +94,71 @@ class GovernedTaskRunner:
             scoped[key] = str(candidate.resolve())
         return scoped
 
-    @staticmethod
-    def _execute_tool(tool_name: str, args: dict[str, Any], execute_tool) -> str:
-        if tool_name != "run_command":
+    def _execute_tool(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        execute_tool,
+    ) -> str:
+        if tool_name == "web_fetch":
+            return fetch_public_text(
+                str(args["url"]),
+                max_length=int(args.get("max_length", 10_000)),
+            )
+        if tool_name not in {"run_command", "run_tests", "lint_code"}:
             return execute_tool(tool_name, args)
-        command = shlex.split(str(args["command"]))
+        if tool_name == "run_tests":
+            framework = str(args.get("framework", "") or "pytest")
+            path = str(args.get("path", "."))
+            test_filter = str(args.get("filter", ""))
+            verbose = bool(args.get("verbose", True))
+            commands: dict[str, list[str]] = {
+                "pytest": ["python", "-m", "pytest", path],
+                "unittest": ["python", "-m", "unittest", "discover", path],
+                "jest": ["npx", "jest", path],
+                "vitest": ["npx", "vitest", "run", path],
+                "mocha": ["npx", "mocha", path],
+                "go": ["go", "test", "./..." if path == "." else path],
+                "cargo": ["cargo", "test"],
+                "rspec": ["bundle", "exec", "rspec", path],
+                "phpunit": ["./vendor/bin/phpunit", path],
+            }
+            tokens = commands[framework]
+            if verbose and framework in {"pytest", "unittest", "jest", "go"}:
+                tokens.append("-v" if framework != "jest" else "--verbose")
+            if test_filter:
+                if framework == "pytest":
+                    tokens.extend(("-k", test_filter))
+                elif framework == "go":
+                    tokens.extend(("-run", test_filter))
+                elif framework == "cargo":
+                    tokens.append(test_filter)
+            command = shlex.join(tokens)
+        elif tool_name == "lint_code":
+            linter = str(args.get("linter", "") or "ruff")
+            path = str(args.get("path", "."))
+            fix = bool(args.get("fix", False))
+            commands = {
+                "ruff": ["python", "-m", "ruff", "check", path],
+                "flake8": ["python", "-m", "flake8", path],
+                "eslint": ["npx", "eslint", path],
+                "golangci-lint": ["golangci-lint", "run", path],
+                "clippy": ["cargo", "clippy"],
+            }
+            tokens = commands[linter]
+            if fix and linter in {"ruff", "eslint"}:
+                tokens.append("--fix")
+            command = shlex.join(tokens)
+        else:
+            command = str(args["command"])
         timeout = max(1, min(int(args.get("timeout", 120)), 300))
-        allowed_environment = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "PYTHONPATH", "VIRTUAL_ENV"}}
-        allowed_environment.update({"PAGER": "cat", "GIT_PAGER": "cat", "CI": "1"})
         try:
-            completed = subprocess.run(command, shell=False, cwd=args.get("cwd"), capture_output=True, text=True, timeout=timeout, env=allowed_environment, check=False)
-        except subprocess.TimeoutExpired:
-            return f"❌ Command timed out after {timeout}s: {args['command']}"
-        except OSError as exc:
+            completed = run_governed_command(
+                command,
+                workspace=str(args["cwd"]),
+                timeout=timeout,
+            )
+        except GovernanceError as exc:
             return f"❌ Cannot execute command: {exc}"
         output = completed.stdout
         if completed.stderr:
@@ -136,7 +196,8 @@ class GovernedTaskRunner:
         final_response = ""
         iterations = 0
 
-        for iterations in range(1, max_iterations + 1):
+        for iteration in range(1, max_iterations + 1):
+            iterations = iteration
             response = client.chat_sync(model_id=model_cfg["id"], messages=messages, tools=tools if model_cfg.get("supports_tools") and tools else None)
             choice = response.choices[0]
             content = choice.message.content or ""
@@ -161,9 +222,26 @@ class GovernedTaskRunner:
                     args["cwd"] = packet["workspace"]
                 scoped_args = self._scope_tool_args(call.function.name, args, packet["workspace"])
                 self.control.authorize_tool(task_id, employee.agent_id, call.function.name, scoped_args)
-                result = self._execute_tool(call.function.name, scoped_args, execute_tool)
-                digest = hashlib.sha256(result.encode("utf-8", errors="replace")).hexdigest()[:16]
-                evidence.append({"type": "tool_result", "reference": f"{call.function.name}:sha256:{digest}", "success": not result.startswith("❌"), "excerpt": result[:500]})
+                result = self._execute_tool(
+                    call.function.name,
+                    scoped_args,
+                    execute_tool,
+                )
+                record = self.control.evidence.put_text(
+                    result,
+                    source=f"task:{task_id}:tool:{call.function.name}",
+                )
+                evidence.append(
+                    {
+                        "type": "tool_result",
+                        "reference": record.reference,
+                        "sha256": record.sha256,
+                        "byte_length": record.byte_length,
+                        "tool": call.function.name,
+                        "success": not result.startswith("❌"),
+                        "excerpt": result[:500],
+                    }
+                )
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
         else:
             raise GovernanceError(f"Employee exceeded the {max_iterations}-iteration execution limit")
@@ -171,8 +249,19 @@ class GovernedTaskRunner:
         if not final_response:
             raise GovernanceError("Employee returned no completion summary")
         if not evidence:
-            digest = hashlib.sha256(final_response.encode()).hexdigest()[:16]
-            evidence.append({"type": "agent_output", "reference": f"response:sha256:{digest}", "success": True})
+            record = self.control.evidence.put_text(
+                final_response,
+                source=f"task:{task_id}:agent_output",
+            )
+            evidence.append(
+                {
+                    "type": "agent_output",
+                    "reference": record.reference,
+                    "sha256": record.sha256,
+                    "byte_length": record.byte_length,
+                    "success": True,
+                }
+            )
 
         estimated_cost = route["estimated_cost_cents"]
         if estimated_cost:
@@ -231,7 +320,20 @@ class GovernedReviewRunner:
         self.control._ensure_agent_enabled(reviewer_id)
         reviewer = get_agent(reviewer_id)
 
-        failed_evidence = [item for item in task["evidence"] if item.get("success") is False]
+        worker_model = os.environ.get("AMAURA_LOCAL_MODEL", "nova:3b").strip()
+        model_id = (
+            os.environ.get("AMAURA_LOCAL_REVIEW_MODEL", "").strip()
+            or worker_model
+        )
+        if model_id == worker_model:
+            raise GovernanceError(
+                "Independent automated review requires a model distinct from "
+                "AMAURA_LOCAL_MODEL"
+            )
+        deterministic = deterministic_evidence_review(task, self.control.evidence)
+        failed_evidence = [
+            item for item in task["evidence"] if item.get("success") is False
+        ]
         review_packet = {
             "task_id": task["id"],
             "title": task["title"],
@@ -254,7 +356,6 @@ class GovernedReviewRunner:
             },
             {"role": "user", "content": "INDEPENDENT REVIEW PACKET:\n" + json.dumps(review_packet, indent=2)},
         ]
-        model_id = os.environ.get("AMAURA_LOCAL_REVIEW_MODEL") or os.environ.get("AMAURA_LOCAL_MODEL", "nova:3b")
         response = self._client(reviewer).chat_sync(model_id=model_id, messages=messages, tools=None)
         content = response.choices[0].message.content or ""
         decision = _extract_json_object(content)
@@ -262,9 +363,26 @@ class GovernedReviewRunner:
         findings = decision.get("findings")
         if not isinstance(approve, bool) or not isinstance(findings, str) or not findings.strip():
             raise GovernanceError("Reviewer decision is missing approve/findings")
-        if failed_evidence:
+        if not deterministic["approve"]:
             approve = False
-            findings = "Rejected deterministically because submitted evidence contains failed tool results. " + findings.strip()
+            deterministic_findings = "; ".join(deterministic["findings"])
+            findings = (
+                "Rejected by deterministic evidence verification: "
+                f"{deterministic_findings}. {findings.strip()}"
+            )
+        decision = {
+            "approve": approve,
+            "findings": findings.strip(),
+            "criteria": decision.get("criteria", []),
+        }
+        attestation = create_review_attestation(
+            task_id=task_id,
+            reviewer_id=reviewer_id,
+            reviewer_model=model_id,
+            decision=decision,
+            deterministic_review=deterministic,
+        )
+        self.control.store.record_review_attestation(attestation)
         updated = self.control.review_task(task_id, actor=reviewer_id, approve=approve, findings=findings.strip())
         self.control.store.audit(
             reviewer_id,
@@ -272,6 +390,22 @@ class GovernedReviewRunner:
             "task",
             task_id,
             "approved" if approve else "rejected",
-            {"model": model_id, "criteria": decision.get("criteria", []), "failed_evidence": len(failed_evidence)},
+            {
+                "model": model_id,
+                "criteria": decision.get("criteria", []),
+                "failed_evidence": len(failed_evidence),
+                "submission_sha256": deterministic["submission_sha256"],
+                "attestation_signature": attestation["signature"],
+            },
         )
-        return {"task_id": task_id, "reviewer_id": reviewer_id, "approve": approve, "findings": findings.strip(), "state": updated["state"], "criteria": decision.get("criteria", [])}
+        return {
+            "task_id": task_id,
+            "reviewer_id": reviewer_id,
+            "reviewer_model": model_id,
+            "approve": approve,
+            "findings": findings.strip(),
+            "state": updated["state"],
+            "criteria": decision.get("criteria", []),
+            "deterministic_review": deterministic,
+            "attestation": attestation,
+        }

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 POLICIES: dict[str, dict[str, Any]] = {
     "core_authority": {
         "version": "1.0",

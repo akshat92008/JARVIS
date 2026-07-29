@@ -6,7 +6,6 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-
 PROMPT_VERSION = "2026.07.27"
 _SOURCE = Path(__file__).with_name("revenue_workforce.md")
 _HEADING_TO_KEY = {

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.amaura.content_factory import ContentFactory
+from jarvis.amaura.evidence import EvidenceVault
 from jarvis.amaura.model_gateway import ModelGateway
 from jarvis.amaura.models import ApprovalStatus, GovernanceError, RiskLevel, TaskState
 from jarvis.amaura.pipeline import AcquisitionPipeline
@@ -17,6 +18,7 @@ from jarvis.amaura.policy import PolicyEngine, tool_risk_class
 from jarvis.amaura.prompts import PROMPT_VERSION
 from jarvis.amaura.registry import AGENTS_BY_ID, ALL_AGENTS, get_agent
 from jarvis.amaura.store import CompanyStore
+from jarvis.amaura.telemetry import OperationalTelemetry
 from jarvis.amaura.workflows import WORKFLOWS, get_workflow
 
 
@@ -33,6 +35,14 @@ class AmauraControlPlane:
         self.founder_name = os.environ.get("AMAURA_FOUNDER_NAME", "Akshat")
         self.policy = PolicyEngine()
         self.models = ModelGateway()
+        evidence_dir = Path(
+            os.environ.get(
+                "AMAURA_EVIDENCE_DIR",
+                str(self.store.db_path.parent / "evidence"),
+            )
+        )
+        self.evidence = EvidenceVault(evidence_dir)
+        self.telemetry = OperationalTelemetry(self.store)
         self.acquisition = AcquisitionPipeline(self.store, self.founder_id)
         self.content_factory = ContentFactory(self.store, self.founder_id)
         self.bootstrap()
@@ -397,6 +407,10 @@ class AmauraControlPlane:
         dashboard = self.store.dashboard()
         dashboard["acquisition"] = self.acquisition.dashboard()
         dashboard["founder"] = self.founder_name
+        dashboard["telemetry"] = {
+            "metrics": len(self.store.list_metrics()),
+            "open_alerts": len(self.store.list_alerts(status="open")),
+        }
         dashboard["doctrine"] = {"master": "JARVIS", "independent_review": True, "evidence_required": True, "external_commitments_require_approval": True}
         return dashboard
 

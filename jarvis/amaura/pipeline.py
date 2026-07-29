@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -11,6 +12,11 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from urllib.parse import urlsplit
 
+from jarvis.amaura.integrations import (
+    GmailAdapter,
+    ProviderReceipt,
+    verify_provider_receipt,
+)
 from jarvis.amaura.models import GovernanceError
 from jarvis.amaura.security import redact_sensitive_text, scan_untrusted_text
 from jarvis.amaura.store import CompanyStore
@@ -263,17 +269,46 @@ class AcquisitionPipeline:
                     {"message_id": message_id, "reason": reason}, {"status": updated["status"]})
         return updated
 
-    def confirm_external_send(self, message_id: str, *, external_message_id: str, actor: str,
-                              thread_id: str = "") -> dict:
-        """Record provider-confirmed success. This method does not itself call an email provider."""
+    def confirm_external_send(
+        self,
+        message_id: str,
+        *,
+        actor: str,
+        provider_receipt: ProviderReceipt | dict | None = None,
+        external_message_id: str = "",
+        thread_id: str = "",
+    ) -> dict:
+        """Record a signed provider receipt after an approved external send."""
         self._require_running("sending")
         message = self.store.get_message(message_id)
         if message["status"] == "sent":
             return message
         if message["status"] != "approved":
             raise GovernanceError("Only an approved message can be marked sent")
-        if not external_message_id.strip():
-            raise GovernanceError("No silent success: a provider message identifier is required")
+        provider_name = "manual-break-glass"
+        if provider_receipt is not None:
+            receipt = verify_provider_receipt(
+                provider_receipt,
+                expected_operation="send_email",
+                expected_idempotency_key=message["idempotency_key"],
+            )
+            if receipt.status != "sent" or receipt.provider != "gmail":
+                raise GovernanceError(
+                    "Only a signed Gmail sent receipt can confirm outreach"
+                )
+            external_message_id = receipt.external_id
+            thread_id = receipt.thread_id
+            provider_name = receipt.provider
+        elif os.environ.get("AMAURA_ALLOW_MANUAL_PROVIDER_CONFIRMATION") == "1":
+            if not external_message_id.strip():
+                raise GovernanceError(
+                    "No silent success: a provider message identifier is required"
+                )
+        else:
+            raise GovernanceError(
+                "A signed provider receipt is required; manual success claims "
+                "are disabled"
+            )
         lead = self.store.get_lead(message["lead_id"])
         if lead["do_not_contact"]:
             raise GovernanceError("Lead opted out after approval; sending is blocked")
@@ -293,8 +328,39 @@ class AcquisitionPipeline:
         self.store.update_lead(lead["id"], stage=LeadStage.SENT.value, next_action="review reply or prepare follow-up",
                                next_action_at=next_at.isoformat())
         self._event(lead["id"], lead["campaign_id"], "message.sent", actor,
-                    {"message_id": message_id}, {"external_message_id": external_message_id})
+                    {"message_id": message_id}, {
+                        "external_message_id": external_message_id,
+                        "provider": provider_name,
+                    })
         return updated
+
+    def deliver_approved_message(
+        self,
+        message_id: str,
+        *,
+        recipient: str,
+        actor: str,
+        adapter: GmailAdapter | None = None,
+    ) -> dict:
+        """Call Gmail once and atomically persist only its signed success receipt."""
+
+        message = self.store.get_message(message_id)
+        if message["status"] == "sent":
+            return message
+        if message["status"] != "approved":
+            raise GovernanceError("Only an approved message can be delivered")
+        gmail = adapter or GmailAdapter()
+        receipt = gmail.send(
+            recipient=recipient,
+            subject=message["subject"],
+            body=message["body"],
+            idempotency_key=message["idempotency_key"],
+        )
+        return self.confirm_external_send(
+            message_id,
+            actor=actor,
+            provider_receipt=receipt,
+        )
 
     def set_kill_switch(self, enabled: bool, *, actor: str, reason: str) -> dict:
         if actor not in {"jarvis", self.founder_id} or not reason.strip():

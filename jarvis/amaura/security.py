@@ -6,7 +6,6 @@ import hashlib
 import re
 from dataclasses import dataclass
 
-
 INJECTION_PATTERNS = (
     re.compile(r"\bignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?\b", re.I),
     re.compile(r"\b(?:system|developer)\s+(?:prompt|message)\b", re.I),

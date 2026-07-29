@@ -37,6 +37,8 @@ class CompanyStore:
         "asset_metadata",
         "evidence_snapshot",
         "result",
+        "labels",
+        "attributes",
     }
     MUTABLE_WORK_FIELDS: ClassVar[set[str]] = {
         "owner_id",
@@ -383,6 +385,55 @@ class CompanyStore:
             evidence_refs TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS review_attestations (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES work_items(id),
+            reviewer_id TEXT NOT NULL,
+            reviewer_model TEXT NOT NULL,
+            submission_sha256 TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            attestation TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_attestations_task
+            ON review_attestations(task_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS operational_metrics (
+            name TEXT NOT NULL,
+            labels_key TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '{}',
+            value REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(name, labels_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS operational_traces (
+            id TEXT PRIMARY KEY,
+            operation TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            duration_ms REAL NOT NULL CHECK(duration_ms >= 0),
+            attributes TEXT NOT NULL DEFAULT '{}',
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_operational_traces_created
+            ON operational_traces(created_at);
+
+        CREATE TABLE IF NOT EXISTS operational_alerts (
+            id TEXT PRIMARY KEY,
+            severity TEXT NOT NULL,
+            code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            resource_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            details TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_operational_alerts_status
+            ON operational_alerts(status, created_at);
         """
         with self._lock:
             self._connection.executescript(schema)
@@ -1418,6 +1469,226 @@ class CompanyStore:
             row = self._connection.execute("SELECT * FROM content_metrics WHERE campaign_id=? AND platform=? AND window=?", (entry["campaign_id"], entry["platform"], entry["window"])).fetchone()
         return self._decode_row(row)  # type: ignore[return-value]
 
+    # -- Review attestations and operational telemetry -----------------
+
+    def record_review_attestation(
+        self,
+        attestation: dict[str, Any],
+    ) -> dict[str, Any]:
+        identifier = str(attestation.get("id") or f"review_{uuid.uuid4().hex[:16]}")
+        decision = attestation.get("decision") or {}
+        deterministic = attestation.get("deterministic_review") or {}
+        submission_sha256 = str(deterministic.get("submission_sha256", ""))
+        if not submission_sha256:
+            raise ValueError("Review attestation requires a submission digest")
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO review_attestations(
+                id,task_id,reviewer_id,reviewer_model,submission_sha256,
+                decision,signature,attestation,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    identifier,
+                    attestation["task_id"],
+                    attestation["reviewer_id"],
+                    attestation["reviewer_model"],
+                    submission_sha256,
+                    json.dumps(decision, sort_keys=True, default=str),
+                    attestation["signature"],
+                    json.dumps(attestation, sort_keys=True, default=str),
+                    attestation["created_at"],
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM review_attestations WHERE id=?",
+                (identifier,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("Review attestation insert did not persist")
+        result = dict(row)
+        result["decision"] = json.loads(result["decision"])
+        result["attestation"] = json.loads(result["attestation"])
+        return result
+
+    def list_review_attestations(
+        self,
+        *,
+        task_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM review_attestations"
+        params: list[Any] = []
+        if task_id:
+            query += " WHERE task_id=?"
+            params.append(task_id)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["decision"] = json.loads(item["decision"])
+            item["attestation"] = json.loads(item["attestation"])
+            results.append(item)
+        return results
+
+    @staticmethod
+    def _metric_labels_key(labels: dict[str, str]) -> str:
+        return json.dumps(labels, sort_keys=True, separators=(",", ":"))
+
+    def record_metric(
+        self,
+        *,
+        name: str,
+        labels: dict[str, str],
+        value: float,
+    ) -> dict[str, Any]:
+        labels_key = self._metric_labels_key(labels)
+        now = utc_now()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO operational_metrics(name,labels_key,labels,value,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(name,labels_key) DO UPDATE SET
+                value=operational_metrics.value+excluded.value,
+                updated_at=excluded.updated_at""",
+                (
+                    name,
+                    labels_key,
+                    json.dumps(labels, sort_keys=True),
+                    value,
+                    now,
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM operational_metrics WHERE name=? AND labels_key=?",
+                (name, labels_key),
+            ).fetchone()
+        decoded = self._decode_row(row)
+        if decoded is None:
+            raise RuntimeError("Metric update did not persist")
+        return decoded
+
+    def list_metrics(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT name,labels,value,updated_at FROM operational_metrics "
+                "ORDER BY name,labels_key"
+            ).fetchall()
+        return [self._decode_row(row) for row in rows]  # type: ignore[misc]
+
+    def record_trace(self, trace: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO operational_traces(
+                id,operation,outcome,duration_ms,attributes,error,created_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    trace["id"],
+                    trace["operation"],
+                    trace["outcome"],
+                    float(trace["duration_ms"]),
+                    json.dumps(trace.get("attributes") or {}, sort_keys=True, default=str),
+                    str(trace.get("error", ""))[:1000],
+                    now,
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM operational_traces WHERE id=?",
+                (trace["id"],),
+            ).fetchone()
+        decoded = self._decode_row(row)
+        if decoded is None:
+            raise RuntimeError("Trace insert did not persist")
+        return decoded
+
+    def list_traces(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM operational_traces ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [self._decode_row(row) for row in rows]  # type: ignore[misc]
+
+    def create_alert(self, alert: dict[str, Any]) -> dict[str, Any]:
+        severity = str(alert["severity"]).lower()
+        if severity not in {"info", "warning", "critical"}:
+            raise ValueError("Alert severity must be info, warning, or critical")
+        now = utc_now()
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO operational_alerts(
+                id,severity,code,message,resource_id,status,details,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    alert["id"],
+                    severity,
+                    alert["code"],
+                    alert["message"],
+                    alert.get("resource_id", ""),
+                    "open",
+                    json.dumps(alert.get("details") or {}, sort_keys=True, default=str),
+                    now,
+                ),
+            )
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM operational_alerts WHERE id=?",
+                (alert["id"],),
+            ).fetchone()
+        result = dict(row) if row is not None else None
+        if result is None:
+            raise RuntimeError("Alert insert did not persist")
+        result["details"] = json.loads(result["details"])
+        return result
+
+    def list_alerts(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM operational_alerts"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 5000)))
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item["details"])
+            results.append(item)
+        return results
+
+    def resolve_alert(self, alert_id: str) -> dict[str, Any]:
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE operational_alerts
+                SET status='resolved',resolved_at=?
+                WHERE id=? AND status='open'""",
+                (utc_now(), alert_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Unknown or resolved alert: {alert_id}")
+            self._connection.commit()
+            row = self._connection.execute(
+                "SELECT * FROM operational_alerts WHERE id=?",
+                (alert_id,),
+            ).fetchone()
+        result = dict(row) if row is not None else None
+        if result is None:
+            raise RuntimeError("Resolved alert is missing")
+        result["details"] = json.loads(result["details"])
+        return result
+
     def dashboard(self) -> dict[str, Any]:
         with self._lock:
             states = {row["state"]: row["count"] for row in self._connection.execute("SELECT state, COUNT(*) AS count FROM work_items WHERE item_type = 'task' GROUP BY state").fetchall()}
@@ -1426,6 +1697,9 @@ class CompanyStore:
             total_cost = self._connection.execute("SELECT COALESCE(SUM(amount_cents), 0) FROM costs").fetchone()[0]
             active_programmes = self._connection.execute("SELECT COUNT(*) FROM work_items WHERE item_type = 'programme' AND state NOT IN ('completed','cancelled','failed')").fetchone()[0]
             violations = self._connection.execute("SELECT COUNT(*) FROM audit_logs WHERE outcome = 'denied'").fetchone()[0]
+            open_alerts = self._connection.execute(
+                "SELECT COUNT(*) FROM operational_alerts WHERE status='open'"
+            ).fetchone()[0]
         return {
             "control_plane": "jarvis",
             "active_programmes": active_programmes,
@@ -1433,5 +1707,6 @@ class CompanyStore:
             "pending_approvals": pending,
             "total_cost_cents": total_cost,
             "policy_violations": violations,
+            "open_alerts": open_alerts,
             "agents": {"total": sum(departments.values()), "departments": departments},
         }
