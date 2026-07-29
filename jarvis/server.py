@@ -94,10 +94,14 @@ async def protect_general_mutations(request: Request, call_next):
     elif request.method != "GET" and path.startswith(_GENERAL_MUTATION_PATHS):
         expected = os.environ.get("JARVIS_API_KEY", "")
         remote_mode = os.environ.get("JARVIS_HOST", "127.0.0.1") not in {"127.0.0.1", "localhost", "::1"}
-        if remote_mode and not expected:
-            return JSONResponse(status_code=503, content={"detail": "JARVIS_API_KEY is required for remote mode"})
-        if expected and not hmac.compare_digest(request.headers.get("X-Jarvis-Key", ""), expected):
-            return JSONResponse(status_code=403, content={"detail": "Invalid JARVIS API key"})
+        if remote_mode:
+            if not expected:
+                return JSONResponse(status_code=503, content={"detail": "JARVIS_API_KEY is required for remote mode"})
+            if not hmac.compare_digest(request.headers.get("X-Jarvis-Key", ""), expected):
+                return JSONResponse(status_code=403, content={"detail": "Invalid JARVIS API key"})
+        elif expected and request.headers.get("X-Jarvis-Key"):
+            if not hmac.compare_digest(request.headers.get("X-Jarvis-Key", ""), expected):
+                return JSONResponse(status_code=403, content={"detail": "Invalid JARVIS API key"})
     return await call_next(request)
 
 # ── Models ─────────────────────────────────────────────────────────────────────

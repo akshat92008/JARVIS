@@ -178,18 +178,35 @@ class GovernedTaskRunner:
         if task["state"] != TaskState.IN_PROGRESS.value:
             raise GovernanceError(f"Task runner cannot execute state '{task['state']}'")
 
-        packet = self.control.task_packet(task_id, actor="jarvis")
-        route = packet["model_route"]
+        packet_dict = self.control.task_packet(task_id, actor="jarvis")
+        if task["action_type"] in {"software_delivery", "engineering"} and packet_dict.get("_workspace"):
+            import os
+            workspace = packet_dict["_workspace"]
+            if os.path.isdir(os.path.join(workspace, ".git")):
+                wt_path = f"/tmp/amaura-worktrees/{task_id}"
+                os.makedirs("/tmp/amaura-worktrees", exist_ok=True)
+                if not os.path.exists(wt_path):
+                    run_governed_command(f"git worktree add -B amaura-{task_id} {wt_path} HEAD", workspace=workspace)
+                packet_dict["_workspace"] = wt_path
+                packet_dict["repository_context"]["workspace_dir"] = wt_path
+
+        route = packet_dict.pop("_model_route")
+        workspace = packet_dict.pop("_workspace")
+        approved_names = set(packet_dict.pop("_approved_tools"))
+
+        from jarvis.amaura.models import CanonicalTaskPacket
+        packet_model = CanonicalTaskPacket.model_validate(packet_dict)
+        clean_packet = packet_model.model_dump(mode="json")
+
         from jarvis.tools.registry import ALL_TOOL_DEFINITIONS, execute_tool
 
         employee = get_agent(task["owner_id"])
         local_only = route["provider"] == "local"
         model_cfg = {"id": os.environ.get("AMAURA_LOCAL_MODEL", "nova:3b"), "supports_tools": True} if local_only else (resolve_model(route["model_key"]) or MODELS[DEFAULT_MODEL])
-        approved_names = set(packet["approved_tools"])
         tools = [definition for definition in ALL_TOOL_DEFINITIONS if definition["function"]["name"] in approved_names]
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": employee.system_prompt + "\n\nReturn a concise completion summary. Do not claim success unless tool results support it."},
-            {"role": "user", "content": "JARVIS TASK PACKET:\n" + json.dumps(packet, indent=2)},
+            {"role": "user", "content": "JARVIS TASK PACKET:\n" + json.dumps(clean_packet, indent=2)},
         ]
         client = self._client(route, employee)
         evidence: list[dict[str, Any]] = []
@@ -219,8 +236,8 @@ class GovernedTaskRunner:
                 except json.JSONDecodeError as exc:
                     raise GovernanceError(f"Employee produced invalid arguments for {call.function.name}") from exc
                 if call.function.name == "run_command" and not args.get("cwd"):
-                    args["cwd"] = packet["workspace"]
-                scoped_args = self._scope_tool_args(call.function.name, args, packet["workspace"])
+                    args["cwd"] = workspace
+                scoped_args = self._scope_tool_args(call.function.name, args, workspace)
                 self.control.authorize_tool(task_id, employee.agent_id, call.function.name, scoped_args)
                 result = self._execute_tool(
                     call.function.name,
@@ -249,6 +266,8 @@ class GovernedTaskRunner:
         if not final_response:
             raise GovernanceError("Employee returned no completion summary")
         if not evidence:
+            if task.get("acceptance_criteria"):
+                raise GovernanceError("Employee submitted no verifiable evidence to satisfy acceptance criteria. Agent prose is insufficient.")
             record = self.control.evidence.put_text(
                 final_response,
                 source=f"task:{task_id}:agent_output",
@@ -260,6 +279,7 @@ class GovernedTaskRunner:
                     "sha256": record.sha256,
                     "byte_length": record.byte_length,
                     "success": True,
+                    "excerpt": final_response[:500],
                 }
             )
 

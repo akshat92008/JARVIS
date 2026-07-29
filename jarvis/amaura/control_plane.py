@@ -11,7 +11,7 @@ from typing import Any
 from jarvis.amaura.content_factory import ContentFactory
 from jarvis.amaura.evidence import EvidenceVault
 from jarvis.amaura.model_gateway import ModelGateway
-from jarvis.amaura.models import ApprovalStatus, GovernanceError, RiskLevel, TaskState
+from jarvis.amaura.models import ApprovalStatus, GovernanceError, RiskLevel, TaskState, CanonicalTaskPacket, TaskBudget, TaskDependency, RepositoryContext
 from jarvis.amaura.pipeline import AcquisitionPipeline
 from jarvis.amaura.policies import POLICIES, policies_for
 from jarvis.amaura.policy import PolicyEngine, tool_risk_class
@@ -188,36 +188,40 @@ class AmauraControlPlane:
             estimated_tokens=task["metadata"].get("estimated_tokens", 4000),
             remaining_budget_cents=max(0, remaining),
         )
-        packet = {
-            "issued_by": "jarvis",
-            "task_id": task["id"],
-            "title": task["title"],
-            "objective": task["description"],
-            "success_metric": task["success_metric"],
-            "acceptance_criteria": task["acceptance_criteria"],
-            "owner": {"id": agent.agent_id, "name": agent.name, "department": agent.department},
-            "reviewer_id": task["reviewer_id"],
-            "approved_tools": list(agent.tools),
-            "tool_risk_classes": {name: tool_risk_class(name) for name in agent.tools},
-            "permissions": list(agent.permissions),
-            "approved_data": list(agent.data_access),
-            "budget": {"limit_cents": task["budget_cents"], "spent_cents": task["spent_cents"], "remaining_cents": remaining},
-            "risk": task["risk"],
-            "action_type": task["action_type"],
-            "dependencies": [{"id": dep["id"], "title": dep["title"], "state": dep["state"], "evidence": dep["evidence"]} for dep in dependency_cards],
-            "model_route": route.to_dict(),
-            "prompt": {"profile": task["metadata"].get("prompt_profile"), "version": PROMPT_VERSION},
-            "workspace": task["metadata"].get("workspace"),
-            "policies": policies_for(task["action_type"]),
-            "doctrine": [
+        packet_model = CanonicalTaskPacket(
+            packet_id=_id("pkt"),
+            issued_by="jarvis",
+            owner=agent.agent_id,
+            reviewer=task["reviewer_id"],
+            objective=task["description"],
+            success_metric=task["success_metric"],
+            acceptance_criteria=task["acceptance_criteria"],
+            budget=TaskBudget(limit_cents=task["budget_cents"], spent_cents=task["spent_cents"], remaining=remaining),
+            tools_authorized=list(agent.tools),
+            data_authorized=list(agent.data_access),
+            dependencies=[
+                TaskDependency(
+                    id=dep["id"], title=dep["title"], state=dep["state"], 
+                    summary=dep.get("summary", ""), evidence=dep["evidence"]
+                ) for dep in dependency_cards
+            ],
+            risk_class=task["risk"],
+            action_type=task["action_type"],
+            repository_context=RepositoryContext(workspace_dir=task["metadata"].get("workspace")),
+            doctrine=[
                 "Do not exceed this task packet.",
                 "Attach evidence for every completion claim.",
                 "Do not certify your own work.",
                 "Stop and escalate any unapproved tool, data, cost, or external action.",
-            ],
-        }
+            ]
+        )
         self.store.audit(actor, "issue_task_packet", "task", task_id, "allowed", {"owner": agent.agent_id})
-        return packet
+        packet_dict = packet_model.model_dump(mode="json")
+        # Preserve original fields that executor relies on internally (executor expects to use these, but they won't be shown to the agent in the packet)
+        packet_dict["_model_route"] = route.to_dict()
+        packet_dict["_workspace"] = task["metadata"].get("workspace")
+        packet_dict["_approved_tools"] = list(agent.tools)
+        return packet_dict
 
     def start_task(self, task_id: str, actor: str = "jarvis") -> dict[str, Any]:
         if actor != "jarvis":
@@ -280,6 +284,12 @@ class AmauraControlPlane:
             updated = self.store.update_work_item(task_id, state=TaskState.ASSIGNED.value, summary=f"REVIEW REJECTED: {findings.strip()}\n\nPrevious submission: {task['summary']}")
             self.store.publish_event("qa.rejected", task_id, {"reviewer": actor, "findings": findings})
             self.store.audit(actor, "review", "task", task_id, "rejected", {"findings": findings})
+            if task["action_type"] in {"software_delivery", "engineering"} and task["metadata"].get("workspace"):
+                import os, subprocess
+                wt_path = f"/tmp/amaura-worktrees/{task_id}"
+                if os.path.exists(wt_path):
+                    subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
+                    subprocess.run(["git", "branch", "-D", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
             return updated
 
         gate = self.policy.completion_gate(task)
@@ -486,6 +496,13 @@ class AmauraControlPlane:
 
     def _complete_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
+        if task["action_type"] in {"software_delivery", "engineering"} and task["metadata"].get("workspace"):
+            import os, subprocess
+            wt_path = f"/tmp/amaura-worktrees/{task_id}"
+            if os.path.exists(wt_path):
+                subprocess.run(["git", "merge", "--no-ff", f"amaura-{task_id}", "-m", f"Merge task {task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
+                subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
+                subprocess.run(["git", "branch", "-d", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
         event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"
         self.store.publish_event(event, task_id, {"owner": task["owner_id"], "evidence": len(task["evidence"])})
         self._roll_up(task["parent_id"])

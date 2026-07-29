@@ -226,22 +226,38 @@ class TestAmauraCompanyOS(unittest.TestCase):
         )
         task = result["tasks"][0]
 
-        fake_response = SimpleNamespace(
+        fake_response_1 = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="Checking project structure.",
+                tool_calls=[SimpleNamespace(
+                    id="call_123",
+                    function=SimpleNamespace(name="get_project_structure", arguments='{"path": "."}')
+                )],
+            ))]
+        )
+        fake_response_2 = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(
                 content="Requirements, explicit exclusions, and measurable criteria are complete.",
                 tool_calls=[],
             ))]
         )
-        fake_client = SimpleNamespace(chat_sync=lambda **kwargs: fake_response)
+        
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+            def chat_sync(self, **kwargs):
+                self.calls += 1
+                return fake_response_1 if self.calls == 1 else fake_response_2
+
         execution = GovernedTaskRunner(
             self.control,
-            client_factory=lambda route, employee: fake_client,
+            client_factory=lambda route, employee: FakeClient(),
         ).run(task["id"])
 
         self.assertEqual(execution["employee"], "Product Manager")
         self.assertEqual(execution["status"], TaskState.AWAITING_REVIEW.value)
         stored = self.control.store.get_work_item(task["id"])
-        self.assertEqual(stored["spent_cents"], 0)
+        self.assertEqual(stored["spent_cents"], 1)
         self.assertNotEqual(stored["owner_id"], stored["reviewer_id"])
 
 

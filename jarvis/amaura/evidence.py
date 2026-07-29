@@ -73,6 +73,19 @@ class EvidenceVault:
             media_type="application/json",
         )
 
+    def get_bytes(self, reference: str) -> bytes:
+        if reference.startswith("ev:"):
+            digest = reference[3:]
+        else:
+            digest = reference
+        target = self._path(digest)
+        if not target.exists():
+            raise GovernanceError(f"Evidence reference not found: {reference}")
+        return target.read_bytes()
+
+    def get_text(self, reference: str) -> str:
+        return self.get_bytes(reference).decode("utf-8", errors="replace")
+
     def put_bytes(
         self,
         payload: bytes,

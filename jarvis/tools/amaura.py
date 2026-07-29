@@ -183,14 +183,14 @@ AMAURA_TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "amaura_review_task",
-            "description": "Record an independent reviewer decision. The reviewer must match the registry and cannot be the task owner.",
+            "description": "Record an independent reviewer decision. The reviewer identity is automatically derived from the execution context.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "string"}, "reviewer_id": {"type": "string"},
+                    "task_id": {"type": "string"},
                     "approve": {"type": "boolean"}, "findings": {"type": "string"},
                 },
-                "required": ["task_id", "reviewer_id", "approve", "findings"],
+                "required": ["task_id", "approve", "findings"],
             },
         },
     },
@@ -237,6 +237,104 @@ AMAURA_TOOL_DEFINITIONS = [
             "name": "amaura_daily_briefing",
             "description": "Generate the founder's daily company briefing with costs, blockers, results, risks, and top decisions.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_read_evidence",
+            "description": "Read the contents of an evidence record from the vault by its reference.",
+            "parameters": {
+                "type": "object",
+                "properties": {"reference": {"type": "string"}},
+                "required": ["reference"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_get_campaign_context",
+            "description": "Get detailed context for a campaign.",
+            "parameters": {
+                "type": "object",
+                "properties": {"campaign_id": {"type": "string"}},
+                "required": ["campaign_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_record_lead_evidence",
+            "description": "Record verified evidence for a lead.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "claim_type": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "source_url": {"type": "string"},
+                    "source_excerpt": {"type": "string"},
+                    "confidence": {"type": "number"}
+                },
+                "required": ["lead_id", "claim_type", "claim", "source_url", "source_excerpt", "confidence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_transition_lead",
+            "description": "Transition a lead to a new stage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "to_stage": {"type": "string"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["lead_id", "to_stage", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_stage_outreach",
+            "description": "Stage an outreach message for approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "message_type": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["lead_id", "channel", "message_type", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_register_content_asset",
+            "description": "Register a new content asset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "campaign_id": {"type": "string"},
+                    "asset_type": {"type": "string"},
+                    "uri": {"type": "string"},
+                    "sha256": {"type": "string"},
+                    "source_url": {"type": "string"},
+                    "creator": {"type": "string"},
+                    "licence": {"type": "string"},
+                    "status": {"type": "string"}
+                },
+                "required": ["campaign_id", "asset_type", "uri"],
+            },
         },
     },
 ]
@@ -312,8 +410,10 @@ def supervisor_tick(workflow_id: str = "", automatic_reviews: bool = True) -> st
     ).tick(workflow_id=workflow_id or None))
 
 
-def review_task(task_id: str, reviewer_id: str, approve: bool, findings: str) -> str:
-    return _json(get_control_plane().review_task(task_id, reviewer_id, approve, findings))
+def review_task(task_id: str, approve: bool, findings: str) -> str:
+    control = get_control_plane()
+    task = control.store.get_work_item(task_id)
+    return _json(control.review_task(task_id, task["reviewer_id"], approve, findings))
 
 
 def pending_approvals() -> str:
@@ -337,6 +437,40 @@ def daily_briefing() -> str:
     return _json(get_control_plane().daily_briefing())
 
 
+def read_evidence(reference: str) -> str:
+    try:
+        return _json({"content": get_control_plane().evidence.get_text(reference)})
+    except Exception as exc:
+        return _json({"error": str(exc)})
+
+
+def get_campaign_context(campaign_id: str) -> str:
+    return _json(get_control_plane().store.get_campaign(campaign_id))
+
+
+def record_lead_evidence(lead_id: str, claim_type: str, claim: str, source_url: str, source_excerpt: str, confidence: float) -> str:
+    return _json(get_control_plane().acquisition.add_evidence(
+        lead_id, claim_type=claim_type, claim=claim, source_url=source_url, 
+        source_excerpt=source_excerpt, confidence=confidence, actor="jarvis"
+    ))
+
+
+def transition_lead(lead_id: str, to_stage: str, reason: str) -> str:
+    return _json(get_control_plane().acquisition.transition(lead_id, to_stage, actor="jarvis", reason=reason))
+
+
+def stage_outreach(lead_id: str, channel: str, message_type: str, subject: str, body: str) -> str:
+    return _json(get_control_plane().acquisition.stage_message(
+        lead_id, channel=channel, message_type=message_type, subject=subject, body=body, actor="jarvis"
+    ))
+
+
+def register_content_asset(campaign_id: str, asset_type: str, uri: str, sha256: str = "", source_url: str = "", creator: str = "", licence: str = "", status: str = "draft") -> str:
+    return _json(get_control_plane().content_factory.register_asset(
+        campaign_id, asset_type=asset_type, uri=uri, sha256=sha256, source_url=source_url, creator=creator, licence=licence, status=status
+    ))
+
+
 AMAURA_DISPATCH = {
     "amaura_company_status": company_status,
     "amaura_revenue_dashboard": revenue_dashboard,
@@ -355,4 +489,10 @@ AMAURA_DISPATCH = {
     "amaura_pause_agent": pause_agent,
     "amaura_record_decision": record_decision,
     "amaura_daily_briefing": daily_briefing,
+    "amaura_read_evidence": read_evidence,
+    "amaura_get_campaign_context": get_campaign_context,
+    "amaura_record_lead_evidence": record_lead_evidence,
+    "amaura_transition_lead": transition_lead,
+    "amaura_stage_outreach": stage_outreach,
+    "amaura_register_content_asset": register_content_asset,
 }

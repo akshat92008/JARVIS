@@ -102,3 +102,39 @@ class PolicyDecision:
 
 class GovernanceError(ValueError):
     """Raised when an action violates the Amaura operating doctrine."""
+
+from pydantic import BaseModel, Field
+import uuid
+
+class TaskBudget(BaseModel):
+    limit_cents: int
+    spent_cents: int
+    remaining: int
+
+class TaskDependency(BaseModel):
+    id: str
+    title: str
+    state: str
+    summary: str
+    evidence: list[dict[str, Any]]
+
+class RepositoryContext(BaseModel):
+    branch: str | None = None
+    workspace_dir: str | None = None
+
+class CanonicalTaskPacket(BaseModel):
+    packet_id: str = Field(default_factory=lambda: f"pkt_{uuid.uuid4().hex[:12]}")
+    issued_by: str = "jarvis"
+    owner: str
+    reviewer: str
+    objective: str
+    success_metric: str
+    acceptance_criteria: list[str]
+    budget: TaskBudget
+    tools_authorized: list[str]
+    data_authorized: list[str]
+    dependencies: list[TaskDependency]
+    risk_class: str
+    action_type: str
+    repository_context: RepositoryContext
+    doctrine: list[str]

@@ -370,6 +370,12 @@ class JarvisAgent:
 
     def _execute_tool_with_safety(self, name: str, args: dict) -> tuple[str, bool]:
         """Execute a tool with safety checks."""
+        # Enforce operator auth for Amaura tools
+        if name.startswith("amaura_"):
+            import os
+            if not os.environ.get("AMAURA_OPERATOR_KEY"):
+                return "❌ AUTH_ERROR: AMAURA_OPERATOR_KEY is missing in environment. Cannot execute Amaura operations.", False
+
         command = args.get("command", "")
         file_path = args.get("path", "") or args.get("file_path", "")
 
@@ -382,8 +388,7 @@ class JarvisAgent:
             safety_check = self.safety.check_file_write(file_path, content)
 
         if safety_check and not safety_check.is_allowed:
-            if safety_check.level == SafetyLevel.BLOCKED:
-                return f"❌ BLOCKED: {safety_check.reason}", False
+            return safety_check.format_warning(), False
 
         # Execute
         result = execute_tool(name, args)
