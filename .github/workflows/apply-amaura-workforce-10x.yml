@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - agent/amaura-workforce-10x
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   apply-validated-patch:
-    if: ${{ !contains(github.event.head_commit.message, '[amaura-10x-applied]') }}
+    if: ${{ !contains(github.event.head_commit.message || '', '[amaura-10x-applied]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
