@@ -1,0 +1,33 @@
+name: Apply Amaura Workforce 10x
+
+on:
+  push:
+    branches:
+      - agent/amaura-workforce-10x
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validated-patch:
+    if: ${{ !contains(github.event.head_commit.message, '[amaura-10x-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/amaura-workforce-10x
+          fetch-depth: 0
+      - name: Apply validated patch
+        run: |
+          gzip -dc .github/amaura-workforce-10x.patch.gz | git apply --index --binary
+          rm -f .github/amaura-workforce-10x.patch.gz
+          rm -f .github/workflows/apply-amaura-workforce-10x.yml
+      - name: Validate source compilation
+        run: python -m compileall -q .
+      - name: Commit applied upgrade
+        run: |
+          git config user.name "Amaura Build Agent"
+          git config user.email "agent@amaura.local"
+          git add -A
+          git commit -m "feat(amaura): harden and wire workforce [amaura-10x-applied]"
+          git push origin HEAD:agent/amaura-workforce-10x
