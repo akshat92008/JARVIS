@@ -249,11 +249,16 @@ AMAURA_MUTATING_TOOLS = {
     "amaura_create_program", "amaura_run_task", "amaura_review_task", "amaura_record_decision", "amaura_pause_agent",
     "amaura_create_campaign", "amaura_discover_lead", "amaura_score_lead",
     "amaura_supervisor_tick",
+    # Previously missing mutation tools (P0-4)
+    "amaura_record_lead_evidence", "amaura_transition_lead",
+    "amaura_stage_outreach", "amaura_register_content_asset",
 }
 AMAURA_PROTECTED_TOOLS = AMAURA_MUTATING_TOOLS | {
     "amaura_list_agents", "amaura_list_tasks", "amaura_task_packet",
     "amaura_pending_approvals", "amaura_daily_briefing", "amaura_revenue_dashboard",
     "amaura_supervisor_status",
+    # Sensitive reads also require operator authentication
+    "amaura_read_evidence", "amaura_get_campaign_context",
 }
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
@@ -305,9 +310,20 @@ async def get_models():
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
+async def chat(
+    req: ChatRequest,
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
     """Non-streaming chat endpoint."""
     agent = get_or_create_agent(req.session_id, req.model)
+    # P0-3: attach an authenticated session token when the operator key header is present.
+    # This enables Amaura tool calls within this chat session without requiring full auth
+    # at each tool call site.
+    if operator_key:
+        try:
+            agent.set_amaura_session_token(operator_key)
+        except ValueError:
+            pass  # invalid key \u2014 session token stays None; Amaura tools will reject
     response = await asyncio.to_thread(agent.run_non_interactive, req.message)
     return {
         "response": response,
@@ -459,7 +475,13 @@ async def fable_generate(req: ChatRequest):
 
 # ── Amaura Studio Company OS ──────────────────────────────────────────────────
 
+def _amaura_bus():
+    from jarvis.amaura.bus import CommandBus
+    return CommandBus(_amaura_control())
+
+
 def _amaura_control():
+    from jarvis.amaura import commands as cmd
     from jarvis.tools.amaura import get_control_plane
     return get_control_plane()
 
@@ -470,6 +492,28 @@ def _require_amaura_key(environment_name: str, supplied: str, authority: str) ->
         raise HTTPException(status_code=503, detail=f"{environment_name} is not configured")
     if not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=403, detail=f"Invalid Amaura {authority} key")
+
+
+def _resolve_reviewer_from_key(reviewer_key: str) -> str | None:
+    """Resolve a reviewer identity from the X-Amaura-Reviewer-Key header (P0-5).
+
+    AMAURA_REVIEWER_KEYS format: ``reviewer_id:hex_key,reviewer_id2:hex_key2``
+    Returns the reviewer_id whose key matches, or None if no match.
+    Falls back to None when no reviewer keys are configured (callers handle fallback).
+    """
+    config = os.environ.get("AMAURA_REVIEWER_KEYS", "").strip()
+    if not config:
+        return None  # caller will fall back to req.reviewer_id with a deprecation warning
+    for entry in config.split(","):
+        entry = entry.strip()
+        if ":" not in entry:
+            continue
+        agent_id, key = entry.split(":", 1)
+        agent_id, key = agent_id.strip(), key.strip()
+        if key and reviewer_key and hmac.compare_digest(reviewer_key, key):
+            return agent_id
+    return None
+
 
 
 @app.get("/api/amaura/dashboard")
@@ -517,7 +561,8 @@ async def amaura_create_programme(
     """Have JARVIS translate a founder objective into governed work."""
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().create_program(
+        cmd_obj = cmd.CreateProgramCommand(
+            
             objective=req.objective,
             success_metric=req.success_metric,
             workflow_key=req.workflow_key,
@@ -527,6 +572,7 @@ async def amaura_create_programme(
             inputs=req.inputs,
             actor="jarvis",
         )
+        return _amaura_bus().execute(cmd_obj)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -581,13 +627,27 @@ async def amaura_supervisor_tick(
 async def amaura_review_task(
     task_id: str, req: AmauraReviewRequest,
     operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+    reviewer_key: str = Header(default="", alias="X-Amaura-Reviewer-Key"),
 ):
-    """Record independent QA; task owners cannot call this for their own work."""
+    """Record independent QA; reviewer identity comes from authenticated header (P0-5)."""
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    # P0-5: resolve reviewer from the authenticated key header, not from request body.
+    reviewer_id = _resolve_reviewer_from_key(reviewer_key)
+    if reviewer_id is None:
+        # Fallback for environments without AMAURA_REVIEWER_KEYS configured.
+        # This preserves backwards compatibility but is deprecated — configure
+        # AMAURA_REVIEWER_KEYS to enable reviewer-identity authentication.
+        import logging
+        logging.getLogger("amaura.security").warning(
+            "P0-5: reviewer_id taken from request body because AMAURA_REVIEWER_KEYS "
+            "is not configured. Set AMAURA_REVIEWER_KEYS to prevent impersonation."
+        )
+        reviewer_id = req.reviewer_id
     try:
-        return _amaura_control().review_task(task_id, req.reviewer_id, req.approve, req.findings)
+        return _amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=reviewer_id, approve=req.approve, findings=req.findings))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 
 @app.get("/api/amaura/approvals")
@@ -682,7 +742,7 @@ async def amaura_revenue_dashboard(operator_key: str = Header(default="", alias=
 async def amaura_create_campaign(req: AmauraCampaignRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.create_campaign(**req.model_dump())
+        return _amaura_bus().execute(cmd.CreateCampaignCommand(**req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -697,7 +757,7 @@ async def amaura_list_leads(campaign_id: str = "", stage: str = "", operator_key
 async def amaura_discover_pipeline_lead(req: AmauraLeadRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.discover_lead(**req.model_dump())
+        return _amaura_bus().execute(cmd.DiscoverLeadCommand(**req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -706,7 +766,7 @@ async def amaura_discover_pipeline_lead(req: AmauraLeadRequest, operator_key: st
 async def amaura_add_lead_evidence(lead_id: str, req: AmauraEvidenceRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.add_evidence(lead_id, **req.model_dump())
+        return _amaura_bus().execute(cmd.AddEvidenceCommand(lead_id=lead_id, **req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -715,7 +775,7 @@ async def amaura_add_lead_evidence(lead_id: str, req: AmauraEvidenceRequest, ope
 async def amaura_score_pipeline_lead(lead_id: str, req: AmauraLeadScoreRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.score_lead(lead_id, req.model_dump())
+        return _amaura_bus().execute(cmd.ScoreLeadCommand(lead_id=lead_id, components=req.model_dump(), actor="qualification_bot"))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -724,7 +784,7 @@ async def amaura_score_pipeline_lead(lead_id: str, req: AmauraLeadScoreRequest, 
 async def amaura_transition_pipeline_lead(lead_id: str, req: AmauraTransitionRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.transition(lead_id, **req.model_dump())
+        return _amaura_bus().execute(cmd.TransitionLeadCommand(lead_id=lead_id, **req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -733,7 +793,7 @@ async def amaura_transition_pipeline_lead(lead_id: str, req: AmauraTransitionReq
 async def amaura_stage_pipeline_message(lead_id: str, req: AmauraMessageRequest, operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().acquisition.stage_message(lead_id, **req.model_dump())
+        return _amaura_bus().execute(cmd.StageMessageCommand(lead_id=lead_id, **req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -796,7 +856,7 @@ async def amaura_create_content_campaign(req: AmauraContentCampaignRequest,
                                          operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().content_factory.create_campaign(**req.model_dump())
+        return _amaura_bus().execute(cmd.ContentCreateCampaignCommand(**req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -806,7 +866,7 @@ async def amaura_register_content_asset(campaign_id: str, req: AmauraContentAsse
                                         operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_control().content_factory.register_asset(campaign_id, **req.model_dump())
+        return _amaura_bus().execute(cmd.RegisterAssetCommand(campaign_id=campaign_id, **req.model_dump()))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -827,7 +887,7 @@ async def amaura_record_content_metrics(campaign_id: str, req: AmauraContentMetr
     data = req.model_dump()
     data["captured_at"] = data["captured_at"] or None
     try:
-        return _amaura_control().content_factory.record_metrics(campaign_id, **data)
+        return _amaura_bus().execute(cmd.RecordMetricsCommand(campaign_id=campaign_id, **data))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

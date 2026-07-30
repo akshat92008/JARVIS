@@ -73,11 +73,16 @@ class EvidenceVault:
             media_type="application/json",
         )
 
+    @staticmethod
+    def _parse_digest(reference: str) -> str:
+        """Extract the bare hex digest from any supported reference format."""
+        for prefix in ("evidence://sha256/", "ev:"):
+            if reference.startswith(prefix):
+                return reference[len(prefix):]
+        return reference
+
     def get_bytes(self, reference: str) -> bytes:
-        if reference.startswith("ev:"):
-            digest = reference[3:]
-        else:
-            digest = reference
+        digest = self._parse_digest(reference)
         target = self._path(digest)
         if not target.exists():
             raise GovernanceError(f"Evidence reference not found: {reference}")

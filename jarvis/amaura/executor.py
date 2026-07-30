@@ -179,7 +179,9 @@ class GovernedTaskRunner:
             raise GovernanceError(f"Task runner cannot execute state '{task['state']}'")
 
         packet_dict = self.control.task_packet(task_id, actor="jarvis")
-        if task["action_type"] in {"software_delivery", "engineering"} and packet_dict.get("_workspace"):
+        # P0-2: include repository_write (used by builder/patch_engineer in workflows.py)
+        # in addition to software_delivery/engineering so worktrees are created correctly.
+        if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and packet_dict.get("_workspace"):
             import os
             workspace = packet_dict["_workspace"]
             if os.path.isdir(os.path.join(workspace, ".git")):
@@ -212,6 +214,7 @@ class GovernedTaskRunner:
         evidence: list[dict[str, Any]] = []
         final_response = ""
         iterations = 0
+        response = None  # holds last LLM response for model_execution_receipt (P0-8)
 
         for iteration in range(1, max_iterations + 1):
             iterations = iteration
@@ -284,8 +287,35 @@ class GovernedTaskRunner:
             )
 
         estimated_cost = route["estimated_cost_cents"]
+        # P0-8: record the actual model and provider for every inference, not just the route name.
+        # The provider may have remapped the requested model to a fallback.
+        last_usage = getattr(response, "usage", None) if response is not None else None
+        model_execution_receipt = {
+            "requested_route": route["model_key"],
+            "actual_model": getattr(response, "model", route["model_key"]) if response is not None else route["model_key"],
+            "provider": route["provider"],
+            "fallback_model_key": route.get("fallback_model_key"),
+            "input_tokens": getattr(last_usage, "prompt_tokens", 0) if last_usage else 0,
+            "output_tokens": getattr(last_usage, "completion_tokens", 0) if last_usage else 0,
+            "estimated_cost_cents": estimated_cost,
+            "iterations": iterations,
+        }
+        receipt_record = self.control.evidence.put_json(
+            model_execution_receipt,
+            source=f"task:{task_id}:model_execution_receipt",
+        )
+        evidence.append(
+            {
+                "type": "model_execution_receipt",
+                "reference": receipt_record.reference,
+                "sha256": receipt_record.sha256,
+                "byte_length": receipt_record.byte_length,
+                "success": True,
+                "excerpt": f"model={model_execution_receipt['actual_model']} provider={model_execution_receipt['provider']} tokens={model_execution_receipt['input_tokens']}+{model_execution_receipt['output_tokens']}",
+            }
+        )
         if estimated_cost:
-            self.control.record_cost(task_id, employee.agent_id, estimated_cost, "model_inference", metadata={"model": route["model_key"], "iterations": iterations})
+            self.control.record_cost(task_id, employee.agent_id, estimated_cost, "model_inference", metadata=model_execution_receipt)
         submitted = self.control.submit_task(task_id, employee.agent_id, final_response, evidence)
         return {
             "status": submitted["state"],
@@ -294,6 +324,7 @@ class GovernedTaskRunner:
             "iterations": iterations,
             "summary": final_response,
             "evidence": evidence,
+            "model_execution_receipt": model_execution_receipt,
             "reviewer": submitted["reviewer_id"],
         }
 

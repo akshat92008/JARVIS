@@ -256,6 +256,10 @@ class JarvisAgent:
         # Voice mode flag (set by CLI)
         self.voice_mode = False
 
+        # Amaura session token — must be set explicitly via set_amaura_session_token()
+        # before Amaura tool calls are permitted from this agent session (P0-3).
+        self._amaura_session_token: str | None = None
+
         # Build system prompt with personal memory
         self._update_system_prompt()
 
@@ -281,6 +285,21 @@ class JarvisAgent:
         self.model_key = model_key
         self.model_cfg = cfg
         return True
+
+    def set_amaura_session_token(self, token: str) -> None:
+        """Attach an authenticated operator token to this session (P0-3).
+
+        The token must match AMAURA_OPERATOR_KEY.  The server calls this only
+        after validating the X-Amaura-Operator-Key header, so the agent cannot
+        be prompted into executing Amaura mutations without prior authentication.
+        """
+        import hmac as _hmac
+        expected = os.environ.get("AMAURA_OPERATOR_KEY", "")
+        if not expected:
+            raise ValueError("AMAURA_OPERATOR_KEY is not configured")
+        if not _hmac.compare_digest(token, expected):
+            raise ValueError("Supplied token does not match AMAURA_OPERATOR_KEY")
+        self._amaura_session_token = token
 
     def clear_history(self):
         """Clear conversation history."""
@@ -370,11 +389,22 @@ class JarvisAgent:
 
     def _execute_tool_with_safety(self, name: str, args: dict) -> tuple[str, bool]:
         """Execute a tool with safety checks."""
-        # Enforce operator auth for Amaura tools
+        # P0-3: Amaura tools require both the env-var to be set AND an authenticated
+        # session token.  The token is attached by the server only after the operator
+        # key header is validated — env-var presence alone is insufficient.
         if name.startswith("amaura_"):
-            import os
-            if not os.environ.get("AMAURA_OPERATOR_KEY"):
+            import os as _os, hmac as _hmac
+            env_key = _os.environ.get("AMAURA_OPERATOR_KEY", "")
+            session_token = self._amaura_session_token
+            if not env_key:
                 return "❌ AUTH_ERROR: AMAURA_OPERATOR_KEY is missing in environment. Cannot execute Amaura operations.", False
+            if not session_token or not _hmac.compare_digest(session_token, env_key):
+                return (
+                    "❌ AUTH_ERROR: This session does not carry an authenticated Amaura "
+                    "operator token. Use the /api/amaura/* endpoints or authenticate "
+                    "through the server before invoking Amaura tools.",
+                    False,
+                )
 
         command = args.get("command", "")
         file_path = args.get("path", "") or args.get("file_path", "")

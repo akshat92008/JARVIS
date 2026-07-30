@@ -124,50 +124,54 @@ class AmauraControlPlane:
             "success_metric": success_metric,
             "metadata": {"inputs": supplied},
         }
-        self.store.insert_work_item({**base, "id": programme_id, "parent_id": None, "item_type": "programme", "title": programme_title, "description": objective})
-        self.store.insert_work_item(
-            {**base, "id": project_id, "parent_id": programme_id, "item_type": "project", "title": workflow.name, "description": f"Execute the {workflow.name} workflow for: {objective}"}
-        )
-        self.store.insert_work_item({**base, "id": milestone_id, "parent_id": project_id, "item_type": "milestone", "title": f"Complete {workflow.name}", "description": success_metric})
-
         step_ids = {step.key: _id("task") for step in workflow.steps}
         tasks: list[dict[str, Any]] = []
-        for step in workflow.steps:
-            task = self.store.insert_work_item(
-                {
-                    "id": step_ids[step.key],
-                    "parent_id": milestone_id,
-                    "item_type": "task",
-                    "workflow_id": workflow.key,
-                    "title": step.title,
-                    "description": step.description,
-                    "owner_id": step.owner_id,
-                    "reviewer_id": step.reviewer_id,
-                    "state": TaskState.ASSIGNED.value,
-                    "priority": priority,
-                    "deadline": deadline,
-                    "budget_cents": step.budget_cents,
-                    "risk": step.risk.value,
-                    "action_type": step.action_type,
-                    "success_metric": success_metric,
-                    "acceptance_criteria": list(step.acceptance_criteria),
-                    "dependencies": [step_ids[key] for key in step.depends_on],
-                    "metadata": {
-                        "step_key": step.key,
-                        "programme_id": programme_id,
-                        "inputs": supplied,
-                        "workspace": str(workspace),
-                        "sensitivity": supplied.get("sensitivity", "internal"),
-                        "prompt_profile": step.prompt_profile,
-                    },
-                }
+
+        # Priority-1: all inserts are one atomic transaction — any policy failure rolls
+        # back the whole programme rather than leaving orphaned partial rows.
+        with self.store.atomic_block():
+            self.store.insert_work_item({**base, "id": programme_id, "parent_id": None, "item_type": "programme", "title": programme_title, "description": objective})
+            self.store.insert_work_item(
+                {**base, "id": project_id, "parent_id": programme_id, "item_type": "project", "title": workflow.name, "description": f"Execute the {workflow.name} workflow for: {objective}"}
             )
-            decision = self.policy.validate_assignment(task)
-            if not decision.allowed:
-                self.store.audit(actor, "assign", "task", task["id"], "denied", decision.to_dict())
-                raise GovernanceError("; ".join(decision.reasons))
-            self.store.audit(actor, "assign", "task", task["id"], "allowed", {"owner": step.owner_id})
-            tasks.append(task)
+            self.store.insert_work_item({**base, "id": milestone_id, "parent_id": project_id, "item_type": "milestone", "title": f"Complete {workflow.name}", "description": success_metric})
+
+            for step in workflow.steps:
+                task = self.store.insert_work_item(
+                    {
+                        "id": step_ids[step.key],
+                        "parent_id": milestone_id,
+                        "item_type": "task",
+                        "workflow_id": workflow.key,
+                        "title": step.title,
+                        "description": step.description,
+                        "owner_id": step.owner_id,
+                        "reviewer_id": step.reviewer_id,
+                        "state": TaskState.ASSIGNED.value,
+                        "priority": priority,
+                        "deadline": deadline,
+                        "budget_cents": step.budget_cents,
+                        "risk": step.risk.value,
+                        "action_type": step.action_type,
+                        "success_metric": success_metric,
+                        "acceptance_criteria": list(step.acceptance_criteria),
+                        "dependencies": [step_ids[key] for key in step.depends_on],
+                        "metadata": {
+                            "step_key": step.key,
+                            "programme_id": programme_id,
+                            "inputs": supplied,
+                            "workspace": str(workspace),
+                            "sensitivity": supplied.get("sensitivity", "internal"),
+                            "prompt_profile": step.prompt_profile,
+                        },
+                    }
+                )
+                decision = self.policy.validate_assignment(task)
+                if not decision.allowed:
+                    self.store.audit(actor, "assign", "task", task["id"], "denied", decision.to_dict())
+                    raise GovernanceError("; ".join(decision.reasons))
+                self.store.audit(actor, "assign", "task", task["id"], "allowed", {"owner": step.owner_id})
+                tasks.append(task)
 
         self.store.publish_event("project.created", programme_id, {"objective": objective, "workflow": workflow.key, "tasks": len(tasks), "success_metric": success_metric})
         self.store.audit(actor, "create_program", "programme", programme_id, "allowed", {"workflow": workflow.key})
@@ -284,7 +288,7 @@ class AmauraControlPlane:
             updated = self.store.update_work_item(task_id, state=TaskState.ASSIGNED.value, summary=f"REVIEW REJECTED: {findings.strip()}\n\nPrevious submission: {task['summary']}")
             self.store.publish_event("qa.rejected", task_id, {"reviewer": actor, "findings": findings})
             self.store.audit(actor, "review", "task", task_id, "rejected", {"findings": findings})
-            if task["action_type"] in {"software_delivery", "engineering"} and task["metadata"].get("workspace"):
+            if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
                 import os, subprocess
                 wt_path = f"/tmp/amaura-worktrees/{task_id}"
                 if os.path.exists(wt_path):
@@ -496,11 +500,22 @@ class AmauraControlPlane:
 
     def _complete_task(self, task_id: str) -> dict[str, Any]:
         task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
-        if task["action_type"] in {"software_delivery", "engineering"} and task["metadata"].get("workspace"):
+        # P0-2: include repository_write so worktree merge/cleanup fires for builder/patch tasks.
+        if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
             import os, subprocess
             wt_path = f"/tmp/amaura-worktrees/{task_id}"
             if os.path.exists(wt_path):
-                subprocess.run(["git", "merge", "--no-ff", f"amaura-{task_id}", "-m", f"Merge task {task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
+                merge_result = subprocess.run(
+                    ["git", "merge", "--no-ff", f"amaura-{task_id}", "-m", f"Merge task {task_id}"],
+                    cwd=task["metadata"]["workspace"],
+                    capture_output=True,
+                )
+                if merge_result.returncode != 0:
+                    # P0-2: do NOT silently swallow a failed merge.
+                    raise GovernanceError(
+                        f"Git merge failed for task {task_id} — task completion blocked.\n"
+                        + merge_result.stderr.decode(errors="replace")
+                    )
                 subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
                 subprocess.run(["git", "branch", "-d", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
         event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"

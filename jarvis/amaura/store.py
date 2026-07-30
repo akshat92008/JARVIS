@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -67,11 +68,34 @@ class CompanyStore:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
+        self._autocommit = True  # set False inside atomic_block to batch commits
         self._migrate()
 
     def close(self) -> None:
         with self._lock:
             self._connection.close()
+
+    @contextlib.contextmanager
+    def atomic_block(self) -> Any:
+        """Context manager that wraps multiple operations in a single transaction (P1).
+
+        Within the block, individual operations skip their per-row commits.
+        On exit the transaction is committed; on exception it is rolled back.
+        This ensures compound operations (e.g. programme creation) are all-or-nothing.
+        """
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._autocommit = False
+            try:
+                yield
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            finally:
+                self._autocommit = True
+
 
     def integrity_check(self) -> dict[str, Any]:
         """Run SQLite structural and referential integrity checks."""
@@ -297,6 +321,8 @@ class CompanyStore:
             message_type TEXT NOT NULL,
             subject TEXT NOT NULL DEFAULT '',
             body TEXT NOT NULL,
+            recipient TEXT NOT NULL DEFAULT '',
+            approved_payload_hash TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'draft',
             approved_by TEXT,
             approved_at TEXT,
@@ -441,6 +467,9 @@ class CompanyStore:
             self._ensure_column("approvals", "expires_at", "TEXT")
             self._ensure_column("audit_logs", "prev_hash", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("audit_logs", "entry_hash", "TEXT NOT NULL DEFAULT ''")
+            # P0-6: bind recipient and payload hash to message at staging time
+            self._ensure_column("messages", "recipient", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("messages", "approved_payload_hash", "TEXT NOT NULL DEFAULT ''")
             self._backfill_approval_integrity()
             self._backfill_audit_hash_chain()
             self._connection.commit()
@@ -621,7 +650,8 @@ class CompanyStore:
         placeholders = ", ".join("?" for _ in columns)
         with self._lock:
             self._connection.execute(f"INSERT INTO work_items({', '.join(columns)}) VALUES({placeholders})", encoded)
-            self._connection.commit()
+            if self._autocommit:
+                self._connection.commit()
         return self.get_work_item(values["id"])
 
     def get_work_item(self, item_id: str) -> dict[str, Any]:
@@ -1050,12 +1080,19 @@ class CompanyStore:
 
     def insert_message(self, message: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
-        values = {"subject": "", "status": "draft", "approved_by": None, "approved_at": None, "sent_at": None, "external_message_id": None, "thread_id": None, "evidence_snapshot": [], **message}
+        values = {
+            "subject": "", "recipient": "", "approved_payload_hash": "",
+            "status": "draft", "approved_by": None, "approved_at": None,
+            "sent_at": None, "external_message_id": None, "thread_id": None,
+            "evidence_snapshot": [],
+            **message,
+        }
         with self._lock:
             self._connection.execute(
-                """INSERT INTO messages(id,lead_id,channel,message_type,subject,body,status,approved_by,
+                """INSERT INTO messages(id,lead_id,channel,message_type,subject,body,
+                recipient,approved_payload_hash,status,approved_by,
                 approved_at,sent_at,external_message_id,thread_id,idempotency_key,evidence_snapshot,
-                created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     values["id"],
                     values["lead_id"],
@@ -1063,6 +1100,8 @@ class CompanyStore:
                     values["message_type"],
                     values["subject"],
                     values["body"],
+                    values["recipient"],
+                    values["approved_payload_hash"],
                     values["status"],
                     values["approved_by"],
                     values["approved_at"],
@@ -1087,7 +1126,11 @@ class CompanyStore:
         return result
 
     def update_message(self, message_id: str, **fields: Any) -> dict[str, Any]:
-        allowed = {"status", "approved_by", "approved_at", "sent_at", "external_message_id", "thread_id", "subject", "body"}
+        # subject and body are write-once: they are set at staging time and locked
+        # from that point forward to enforce exact-payload approval (P0-6).
+        # approved_payload_hash is written once at approval time by decide_message.
+        allowed = {"status", "approved_by", "approved_at", "sent_at",
+                   "external_message_id", "thread_id", "approved_payload_hash"}
         invalid = set(fields) - allowed
         if invalid:
             raise ValueError(f"Invalid message fields: {', '.join(sorted(invalid))}")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -160,6 +161,13 @@ class AcquisitionPipeline:
         if not 0 <= confidence <= 1:
             raise GovernanceError("Evidence confidence must be between 0 and 1")
         scan = scan_untrusted_text(source_excerpt)
+        # Priority-1: quarantine injection-flagged evidence — do not store or use it.
+        if not scan.safe:
+            raise GovernanceError(
+                f"Evidence rejected: prompt-injection pattern detected in source excerpt "
+                f"(findings: {', '.join(scan.findings)}). Manual review required before "
+                "this lead evidence can be accepted."
+            )
         safe_excerpt = redact_sensitive_text(source_excerpt.strip())
         digest = hashlib.sha256(f"{claim_type}\0{claim}\0{source_url}\0{safe_excerpt}".encode()).hexdigest()
         try:
@@ -212,8 +220,10 @@ class AcquisitionPipeline:
                     {"from": current.value, "reason": reason}, {"to": target.value})
         return updated
 
-    def stage_message(self, lead_id: str, *, channel: str, message_type: str, subject: str,
+    def stage_message(self, lead_id: str, *, recipient: str, channel: str, message_type: str, subject: str,
                       body: str, actor: str = "outreach_writer") -> dict:
+        if not recipient.strip():
+            raise GovernanceError("A recipient address is required to stage a message (P0-6)")
         lead = self.store.get_lead(lead_id)
         campaign = self.store.get_campaign(lead["campaign_id"])
         if lead["do_not_contact"] or LeadStage(lead["stage"]) in TERMINAL_STAGES:
@@ -229,8 +239,8 @@ class AcquisitionPipeline:
         followups = [m for m in self.store.list_messages(lead_id=lead_id) if m["message_type"] == "followup"]
         if message_type == "followup" and len(followups) >= campaign["maximum_followups"]:
             raise GovernanceError("Maximum follow-up count reached")
-        payload = {"lead_id": lead_id, "channel": channel, "message_type": message_type,
-                   "subject": subject.strip(), "body": body.strip()}
+        payload = {"lead_id": lead_id, "recipient": recipient.strip(), "channel": channel,
+                   "message_type": message_type, "subject": subject.strip(), "body": body.strip()}
         key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         existing = self.store.get_idempotency(key)
         if existing:
@@ -259,8 +269,23 @@ class AcquisitionPipeline:
         if datetime.now(UTC) - created > timedelta(hours=48):
             updated = self.store.update_message(message_id, status="stale")
         elif approve:
-            updated = self.store.update_message(message_id, status="approved", approved_by=actor,
-                                                approved_at=datetime.now(UTC).isoformat())
+            # Compute and lock the exact payload hash at approval time (P0-6).
+            approval_payload = {
+                "recipient": message["recipient"],
+                "subject": message["subject"],
+                "body": message["body"],
+                "channel": message["channel"],
+                "lead_id": message["lead_id"],
+                "idempotency_key": message["idempotency_key"],
+            }
+            payload_hash = hashlib.sha256(
+                json.dumps(approval_payload, sort_keys=True).encode()
+            ).hexdigest()
+            updated = self.store.update_message(
+                message_id, status="approved", approved_by=actor,
+                approved_at=datetime.now(UTC).isoformat(),
+                approved_payload_hash=payload_hash,
+            )
         else:
             updated = self.store.update_message(message_id, status="rejected", approved_by=actor,
                                                 approved_at=datetime.now(UTC).isoformat())
@@ -349,6 +374,33 @@ class AcquisitionPipeline:
             return message
         if message["status"] != "approved":
             raise GovernanceError("Only an approved message can be delivered")
+
+        # P0-6: verify the delivery recipient matches the approved recipient.
+        stored_recipient = message.get("recipient", "").strip()
+        if stored_recipient and not hmac.compare_digest(stored_recipient, recipient.strip()):
+            raise GovernanceError(
+                "Delivery recipient does not match the approved recipient — "
+                "the message cannot be re-targeted after approval"
+            )
+
+        # P0-6: re-verify the approved payload hash has not been tampered with.
+        if message.get("approved_payload_hash"):
+            current_payload = {
+                "recipient": message["recipient"],
+                "subject": message["subject"],
+                "body": message["body"],
+                "channel": message["channel"],
+                "lead_id": message["lead_id"],
+                "idempotency_key": message["idempotency_key"],
+            }
+            current_hash = hashlib.sha256(
+                json.dumps(current_payload, sort_keys=True).encode()
+            ).hexdigest()
+            if not hmac.compare_digest(current_hash, message["approved_payload_hash"]):
+                raise GovernanceError(
+                    "Approved payload hash mismatch — message content was altered after approval"
+                )
+
         gmail = adapter or GmailAdapter()
         receipt = gmail.send(
             recipient=recipient,

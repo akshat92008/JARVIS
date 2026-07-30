@@ -15,6 +15,10 @@ _CONTROL: AmauraControlPlane | None = None
 _LOCK = threading.Lock()
 
 
+def get_amaura_bus():
+    from jarvis.amaura.bus import CommandBus
+    return CommandBus(get_control_plane())
+
 def get_control_plane() -> AmauraControlPlane:
     global _CONTROL
     if _CONTROL is None:
@@ -351,28 +355,28 @@ def revenue_dashboard() -> str:
 def create_campaign(campaign_id: str, name: str, target_segment: str, offer: str,
                     minimum_score: int = 70, daily_lead_limit: int = 10,
                     daily_outreach_limit: int = 3) -> str:
-    return _json(get_control_plane().acquisition.create_campaign(
+    return _json(get_amaura_bus().execute(cmd.CreateCampaignCommand(
         campaign_id=campaign_id, name=name, target_segment=target_segment, offer=offer,
         minimum_score=minimum_score, daily_lead_limit=daily_lead_limit,
-        daily_outreach_limit=daily_outreach_limit,
-    ))
+        daily_outreach_limit=daily_outreach_limit, daily_followup_limit=0, maximum_followups=0, config={}
+    )))
 
 
 def discover_lead(campaign_id: str, company_name: str, domain: str, source_url: str,
                   country: str = "", industry: str = "") -> str:
-    return _json(get_control_plane().acquisition.discover_lead(
+    return _json(get_amaura_bus().execute(cmd.DiscoverLeadCommand(
         campaign_id=campaign_id, company_name=company_name, domain=domain, source_url=source_url,
         country=country, industry=industry,
-    ))
+    )))
 
 
 def score_lead(lead_id: str, campaign_fit: int, visible_need: int, ability_to_pay: int,
                contactability: int, portfolio_match: int) -> str:
-    return _json(get_control_plane().acquisition.score_lead(lead_id, {
+    return _json(get_amaura_bus().execute(cmd.ScoreLeadCommand(lead_id=lead_id, components={
         "campaign_fit": campaign_fit, "visible_need": visible_need,
         "ability_to_pay": ability_to_pay, "contactability": contactability,
         "portfolio_match": portfolio_match,
-    }))
+    })))
 
 
 def list_agents() -> str:
@@ -380,10 +384,10 @@ def list_agents() -> str:
 
 
 def create_program(objective: str, success_metric: str, workflow_key: str, title: str = "", priority: int = 3, deadline: str = "", inputs: dict | None = None) -> str:
-    result = get_control_plane().create_program(
+    result = get_amaura_bus().execute(cmd.CreateProgramCommand(
         objective=objective, success_metric=success_metric, workflow_key=workflow_key,
-        title=title or None, priority=priority, deadline=deadline or None, inputs=inputs, actor="jarvis",
-    )
+        title=title or None, priority=priority, deadline=deadline or None, inputs=inputs or {}, actor="jarvis",
+    ))
     return _json(result)
 
 
@@ -413,7 +417,7 @@ def supervisor_tick(workflow_id: str = "", automatic_reviews: bool = True) -> st
 def review_task(task_id: str, approve: bool, findings: str) -> str:
     control = get_control_plane()
     task = control.store.get_work_item(task_id)
-    return _json(control.review_task(task_id, task["reviewer_id"], approve, findings))
+    return _json(get_amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=task["reviewer_id"], approve=approve, findings=findings)))
 
 
 def pending_approvals() -> str:
@@ -421,15 +425,11 @@ def pending_approvals() -> str:
 
 
 def pause_agent(agent_id: str, reason: str) -> str:
-    return _json(get_control_plane().pause_agent(agent_id, reason, actor="jarvis"))
+    return _json(get_amaura_bus().execute(cmd.PauseAgentCommand(agent_id=agent_id, reason=reason, actor="jarvis")))
 
 
 def record_decision(decision: str, context: str, options: list[str], chosen_option: str, reason: str, review_date: str = "") -> str:
-    control = get_control_plane()
-    decision_id = control.record_decision(
-        decision=decision, context=context, options=options, chosen_option=chosen_option,
-        reason=reason, actor="jarvis", review_date=review_date or None,
-    )
+    decision_id = get_amaura_bus().execute(cmd.RecordDecisionCommand(decision=decision, context=context, options=options, chosen_option=chosen_option, reason=reason, actor="jarvis", review_date=review_date or None))
     return _json({"decision_id": decision_id})
 
 
@@ -449,26 +449,28 @@ def get_campaign_context(campaign_id: str) -> str:
 
 
 def record_lead_evidence(lead_id: str, claim_type: str, claim: str, source_url: str, source_excerpt: str, confidence: float) -> str:
-    return _json(get_control_plane().acquisition.add_evidence(
-        lead_id, claim_type=claim_type, claim=claim, source_url=source_url, 
+    return _json(get_amaura_bus().execute(cmd.AddEvidenceCommand(
+        lead_id=lead_id, claim_type=claim_type, claim=claim, source_url=source_url, 
         source_excerpt=source_excerpt, confidence=confidence, actor="jarvis"
-    ))
+    )))
 
 
 def transition_lead(lead_id: str, to_stage: str, reason: str) -> str:
-    return _json(get_control_plane().acquisition.transition(lead_id, to_stage, actor="jarvis", reason=reason))
+    return _json(get_amaura_bus().execute(cmd.TransitionLeadCommand(lead_id=lead_id, stage=to_stage, actor="jarvis", reason=reason)))
 
 
 def stage_outreach(lead_id: str, channel: str, message_type: str, subject: str, body: str) -> str:
-    return _json(get_control_plane().acquisition.stage_message(
-        lead_id, channel=channel, message_type=message_type, subject=subject, body=body, actor="jarvis"
-    ))
+    return _json(get_amaura_bus().execute(cmd.StageMessageCommand(
+        lead_id=lead_id, recipient="", channel=channel, message_type=message_type, subject=subject, body=body
+    )))
 
 
 def register_content_asset(campaign_id: str, asset_type: str, uri: str, sha256: str = "", source_url: str = "", creator: str = "", licence: str = "", status: str = "draft") -> str:
-    return _json(get_control_plane().content_factory.register_asset(
-        campaign_id, asset_type=asset_type, uri=uri, sha256=sha256, source_url=source_url, creator=creator, licence=licence, status=status
-    ))
+    return _json(get_amaura_bus().execute(cmd.RegisterAssetCommand(
+        campaign_id=campaign_id, asset_type=asset_type, uri=uri, sha256=sha256, status=status, metadata={
+            "source_url": source_url, "creator": creator, "licence": licence
+        }
+    )))
 
 
 AMAURA_DISPATCH = {
