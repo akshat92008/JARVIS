@@ -6,10 +6,10 @@ import json
 import threading
 from typing import Any
 
+from jarvis.amaura import commands as cmd
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.executor import GovernedTaskRunner
 from jarvis.amaura.supervisor import AmauraSupervisor
-
 
 _CONTROL: AmauraControlPlane | None = None
 _LOCK = threading.Lock()
@@ -341,6 +341,39 @@ AMAURA_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_send_email",
+            "description": "Send a founder-approved email using the configured external integration (n8n or Gmail).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "recipient": {"type": "string"}
+                },
+                "required": ["message_id", "recipient"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_update_crm",
+            "description": "Update the external CRM with the latest lead status, expected value, probability, and follow-up date.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lead_id": {"type": "string"},
+                    "fields": {
+                        "type": "object",
+                        "description": "CRM fields to update (e.g. status, expected_value, probability, follow_up_date)"
+                    }
+                },
+                "required": ["lead_id", "fields"],
+            },
+        },
+    },
 ]
 
 
@@ -417,7 +450,7 @@ def supervisor_tick(workflow_id: str = "", automatic_reviews: bool = True) -> st
 def review_task(task_id: str, approve: bool, findings: str) -> str:
     control = get_control_plane()
     task = control.store.get_work_item(task_id)
-    return _json(get_amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=task["reviewer_id"], approve=approve, findings=findings)))
+    return _json(get_amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=task["reviewer_id"], approve=approve, findings=findings, attestation=None)))
 
 
 def pending_approvals() -> str:
@@ -473,6 +506,17 @@ def register_content_asset(campaign_id: str, asset_type: str, uri: str, sha256: 
     )))
 
 
+def send_email(message_id: str, recipient: str) -> str:
+    return _json(get_amaura_bus().execute(cmd.DeliverApprovedMessageCommand(
+        message_id=message_id, recipient=recipient
+    )))
+
+
+def update_crm(lead_id: str, fields: dict) -> str:
+    from jarvis.amaura.n8n import get_n8n_client
+    return _json(get_n8n_client().sync_crm(lead_id, fields))
+
+
 AMAURA_DISPATCH = {
     "amaura_company_status": company_status,
     "amaura_revenue_dashboard": revenue_dashboard,
@@ -497,4 +541,6 @@ AMAURA_DISPATCH = {
     "amaura_transition_lead": transition_lead,
     "amaura_stage_outreach": stage_outreach,
     "amaura_register_content_asset": register_content_asset,
+    "amaura_send_email": send_email,
+    "amaura_update_crm": update_crm,
 }

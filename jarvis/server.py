@@ -17,20 +17,21 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import uvicorn
 
 from jarvis.agent import JarvisAgent
+from jarvis.amaura import commands as cmd
+from jarvis.memory import ConversationMemory
 from jarvis.models import DEFAULT_MODEL, list_models
 from jarvis.tools.registry import ALL_TOOL_DEFINITIONS, execute_tool, get_tool_count
-from jarvis.memory import ConversationMemory
 from jarvis.user_memory import UserMemory
 from jarvis.voice.engine import VoiceEngine
-from jarvis.voice.speaker import get_speaker, Speaker
+from jarvis.voice.speaker import Speaker, get_speaker
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 
@@ -457,7 +458,7 @@ async def fable_status():
 @app.get("/api/fable/workspace")
 async def fable_workspace():
     """Get AST symbol graph and workspace files."""
-    from jarvis.fable_engine import WorkspaceExecutor, ASTIndexer
+    from jarvis.fable_engine import ASTIndexer, WorkspaceExecutor
     executor = WorkspaceExecutor()
     indexer = ASTIndexer()
     files = executor.list_workspace()
@@ -481,7 +482,6 @@ def _amaura_bus():
 
 
 def _amaura_control():
-    from jarvis.amaura import commands as cmd
     from jarvis.tools.amaura import get_control_plane
     return get_control_plane()
 
@@ -866,7 +866,22 @@ async def amaura_register_content_asset(campaign_id: str, req: AmauraContentAsse
                                         operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        return _amaura_bus().execute(cmd.RegisterAssetCommand(campaign_id=campaign_id, **req.model_dump()))
+        metadata = req.metadata.copy()
+        if req.source_url:
+            metadata["source_url"] = req.source_url
+        if req.creator:
+            metadata["creator"] = req.creator
+        if req.licence:
+            metadata["licence"] = req.licence
+            
+        return _amaura_bus().execute(cmd.RegisterAssetCommand(
+            campaign_id=campaign_id,
+            asset_type=req.asset_type,
+            uri=req.uri,
+            sha256=req.sha256,
+            status=req.status,
+            metadata=metadata
+        ))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -968,7 +983,7 @@ async def websocket_chat(websocket: WebSocket):
                 })
 
                 loop = asyncio.get_running_loop()
-                def on_event(evt):
+                def on_event(evt, loop=loop):
                     asyncio.run_coroutine_threadsafe(
                         websocket.send_json({
                             "type": "agent_event",

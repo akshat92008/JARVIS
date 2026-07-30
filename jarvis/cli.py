@@ -50,6 +50,7 @@ Environment:
     parser.add_argument("--web", "-w", action="store_true", help="Launch JARVIS Web Interface (HUD)")
     parser.add_argument("--no-web", action="store_true", help="Disable automatic launch of JARVIS Web Interface")
     parser.add_argument("--telegram", "-t", action="store_true", help="Start Telegram bot")
+    parser.add_argument("--amaura", action="store_true", help="Start the Amaura Autonomous Workforce Daemon")
     parser.add_argument("--fable", "-f", action="store_true", help="Execute Claude Fable 5 Mythos CoT reasoning planning engine")
     parser.add_argument("--list-models", action="store_true", help="List available models")
     return parser.parse_args()
@@ -456,6 +457,16 @@ def main():
         ui.print_success(f"JARVIS Web Interface running at {url}")
         from jarvis.server import main as start_server
         start_server()
+        return
+
+    # Amaura daemon mode
+    if args.amaura:
+        ui.print_info("Initializing Amaura daemon environment...")
+        try:
+            from jarvis.amaura.daemon import start_daemon
+            start_daemon()
+        except Exception as e:
+            ui.print_error(f"Failed to start Amaura daemon: {e}")
         return
 
     # Telegram mode

@@ -166,7 +166,7 @@ def production_readiness(
             "content_factory",
             "software_delivery",
         }.issubset(WORKFLOWS),
-        "founder_prompt_catalogue": len(prompts) == 5
+        "founder_prompt_catalogue": len(prompts) >= 43
         and all(len(prompt) > 500 for prompt in prompts.values()),
         "durable_supervisor_store": isinstance(
             control.store.execution_status(),

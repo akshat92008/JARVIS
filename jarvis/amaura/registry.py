@@ -58,6 +58,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.HIGH,
         "founder",
         ("programme outcome rate", "blocked-task age", "budget variance", "founder decision latency"),
+        prompt_profile="jarvis",
     ),
     _agent(
         "opportunity_scout",
@@ -71,6 +72,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "lead_qualification",
         ("qualified opportunities", "source coverage", "false-positive rate"),
+        prompt_profile="opportunity_scout",
     ),
     _agent(
         "lead_qualification",
@@ -84,6 +86,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("accepted-lead win rate", "bad-fit rejection rate"),
+        prompt_profile="lead_qualification",
     ),
     _agent(
         "proposal",
@@ -97,6 +100,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("proposal acceptance rate", "unsupported-claim rate"),
+        prompt_profile="proposal",
     ),
     _agent(
         "crm",
@@ -110,6 +114,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("record completeness", "overdue follow-ups"),
+        prompt_profile="crm",
     ),
     _agent(
         "client_communication",
@@ -123,6 +128,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("draft approval rate", "commitment violations"),
+        prompt_profile="client_communication",
     ),
     _agent(
         "product_manager",
@@ -136,6 +142,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "technical_architect",
         ("acceptance-criteria pass rate", "scope change rate"),
+        prompt_profile="product_manager",
     ),
     _agent(
         "technical_architect",
@@ -149,6 +156,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "qa",
         ("architecture defects", "decision reversals"),
+        prompt_profile="technical_architect",
     ),
     _agent(
         "repository_intelligence",
@@ -162,6 +170,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "technical_architect",
         ("context precision", "wrong-file rate", "context token savings"),
+        prompt_profile="repository_intelligence",
     ),
     _agent(
         "builder",
@@ -175,6 +184,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "qa",
         ("first-pass QA rate", "regression rate", "cost per accepted task"),
+        prompt_profile="builder",
     ),
     _agent(
         "patch_engineer",
@@ -188,6 +198,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "qa",
         ("patch application rate", "wrong-file rate", "format compliance"),
+        prompt_profile="patch_engineer",
     ),
     _agent(
         "qa",
@@ -201,6 +212,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("escaped defects", "false approvals", "verification coverage"),
+        prompt_profile="qa",
     ),
     _agent(
         "content_strategy",
@@ -214,6 +226,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("business-qualified content ideas", "evidence coverage"),
+        prompt_profile="content_strategy",
     ),
     _agent(
         "content_production",
@@ -227,6 +240,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("approval rate", "claim correction rate", "attributed outcomes"),
+        prompt_profile="content_production",
     ),
     _agent(
         "research_evaluation",
@@ -240,6 +254,7 @@ V1_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "qa",
         ("reproducible experiments", "regressions detected", "cost per accepted improvement"),
+        prompt_profile="research_evaluation",
     ),
 )
 
@@ -257,7 +272,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("qualified pipeline value", "positive reply rate", "sales-cycle length", "won revenue"),
-        "revenue_orchestrator",
+        prompt_profile="revenue_orchestrator",
     ),
     _agent(
         "chief_revenue_officer",
@@ -271,7 +286,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("qualified reply rate", "proposal conversion", "average project value", "recurring revenue"),
-        "chief_revenue_officer",
+        prompt_profile="chief_revenue_officer",
     ),
     _agent(
         "campaign_manager",
@@ -285,6 +300,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "chief_revenue_officer",
         ("campaign completeness", "target precision", "limit compliance"),
+        prompt_profile="campaign_manager",
     ),
     _agent(
         "lead_scout",
@@ -298,7 +314,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "prospect_research",
         ("unique qualified discoveries", "duplicate rate", "source coverage"),
-        "lead_discovery_outreach",
+        prompt_profile="lead_discovery_outreach",
     ),
     _agent(
         "prospect_research",
@@ -312,6 +328,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "compliance_reviewer",
         ("evidence completeness", "claim precision", "pages per lead"),
+        prompt_profile="prospect_research",
     ),
     _agent(
         "contact_resolver",
@@ -325,6 +342,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "compliance_reviewer",
         ("verified contact rate", "guessed-address rate"),
+        prompt_profile="contact_resolver",
     ),
     _agent(
         "portfolio_matcher",
@@ -338,6 +356,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "opportunity_analyst",
         ("proof relevance", "unsupported proof rate"),
+        prompt_profile="portfolio_matcher",
     ),
     _agent(
         "opportunity_analyst",
@@ -351,6 +370,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "compliance_reviewer",
         ("observation acceptance", "unsupported-claim rate"),
+        prompt_profile="opportunity_analyst",
     ),
     _agent(
         "outreach_writer",
@@ -364,7 +384,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "compliance_reviewer",
         ("approval rate", "qualified reply rate", "rewrite rate"),
-        "lead_discovery_outreach",
+        prompt_profile="lead_discovery_outreach",
     ),
     _agent(
         "compliance_reviewer",
@@ -378,6 +398,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("false approvals", "policy escape rate", "review precision"),
+        prompt_profile="compliance_reviewer",
     ),
     _agent(
         "approval_coordinator",
@@ -391,6 +412,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.HIGH,
         "founder",
         ("approval packet completeness", "stale approval rate", "unauthorised action rate"),
+        prompt_profile="approval_coordinator",
     ),
     _agent(
         "sales_closer",
@@ -404,7 +426,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("close rate", "advance-payment rate", "scope defects", "recurring revenue"),
-        "sales_closer",
+        prompt_profile="sales_closer",
     ),
     _agent(
         "followup",
@@ -418,6 +440,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "compliance_reviewer",
         ("follow-up reply rate", "limit compliance", "opt-out compliance"),
+        prompt_profile="followup",
     ),
     _agent(
         "reply_intelligence",
@@ -431,6 +454,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "sales_closer",
         ("classification accuracy", "commitment violations", "response latency"),
+        prompt_profile="reply_intelligence",
     ),
     _agent(
         "discovery",
@@ -444,6 +468,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "sales_closer",
         ("brief completeness", "unresolved-risk capture", "next-action clarity"),
+        prompt_profile="discovery",
     ),
     _agent(
         "project_handoff",
@@ -457,6 +482,7 @@ REVENUE_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "product_manager",
         ("handoff completeness", "delivery clarification rate", "credential exposure rate"),
+        prompt_profile="project_handoff",
     ),
 )
 
@@ -474,7 +500,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "jarvis",
         ("qualified enquiries", "portfolio clicks", "influenced revenue"),
-        "marketing_demand_generation",
+        prompt_profile="marketing_demand_generation",
     ),
     _agent(
         "content_research",
@@ -488,6 +514,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "content_strategy",
         ("source quality", "content-gap precision", "business relevance"),
+        prompt_profile="content_research",
     ),
     _agent(
         "scriptwriter",
@@ -501,6 +528,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "media_qa",
         ("claim accuracy", "script approval rate", "repurposing yield"),
+        prompt_profile="scriptwriter",
     ),
     _agent(
         "demo_operator",
@@ -514,6 +542,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "media_qa",
         ("demo success rate", "retake rate", "secret exposure rate"),
+        prompt_profile="demo_operator",
     ),
     _agent(
         "voice_production",
@@ -527,6 +556,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "media_qa",
         ("pronunciation accuracy", "audio defects", "licence compliance"),
+        prompt_profile="voice_production",
     ),
     _agent(
         "asset_curator",
@@ -540,6 +570,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "media_qa",
         ("licence completeness", "asset relevance", "attribution defects"),
+        prompt_profile="asset_curator",
     ),
     _agent(
         "video_production",
@@ -553,6 +584,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "media_qa",
         ("render success", "technical defect rate", "production time"),
+        prompt_profile="video_production",
     ),
     _agent(
         "shorts_editor",
@@ -566,6 +598,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "media_qa",
         ("accepted clips", "context rejection rate", "short retention"),
+        prompt_profile="shorts_editor",
     ),
     _agent(
         "thumbnail_metadata",
@@ -579,6 +612,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.MEDIUM,
         "media_qa",
         ("mobile readability", "title accuracy", "click-through rate"),
+        prompt_profile="thumbnail_metadata",
     ),
     _agent(
         "media_qa",
@@ -592,6 +626,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "jarvis",
         ("escaped claims", "privacy escapes", "technical defect escapes"),
+        prompt_profile="media_qa",
     ),
     _agent(
         "publishing",
@@ -605,6 +640,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.HIGH,
         "founder",
         ("unauthorised publications", "metadata completeness", "schedule accuracy"),
+        prompt_profile="publishing",
     ),
     _agent(
         "content_analytics",
@@ -618,6 +654,7 @@ CONTENT_FACTORY_AGENTS: tuple[CompanyAgent, ...] = (
         RiskLevel.LOW,
         "marketing_head",
         ("lesson evidence quality", "qualified enquiries", "influenced revenue"),
+        prompt_profile="content_analytics",
     ),
 )
 

@@ -37,10 +37,12 @@ jobs:
       - name: Unit and contract tests
         run: python -m pytest -q
       - name: Lint
-        run: ruff check jarvis/amaura scripts tests/test_amaura_production.py tests/test_amaura_contract.py
+        run: ruff check jarvis/amaura jarvis/tools/amaura.py jarvis/server.py scripts tests/test_amaura_production.py tests/test_amaura_contract.py
       - name: Types
         run: >-
           mypy
+          jarvis/server.py
+          jarvis/tools/amaura.py
           jarvis/amaura/capabilities.py
           jarvis/amaura/content_factory.py
           jarvis/amaura/control_plane.py

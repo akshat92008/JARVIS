@@ -46,6 +46,7 @@ class _SuccessfulReviewer:
             actor=task["reviewer_id"],
             approve=True,
             findings="Every acceptance criterion is supported by the submitted report.",
+            attestation={"signature": "mock", "decision": "approved", "task_id": task_id, "reviewer_id": task["reviewer_id"]}
         )
         return {"task_id": task_id, "approve": True, "state": updated["state"]}
 
@@ -62,8 +63,11 @@ class TestAmauraSupervisor(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.control = AmauraControlPlane(Path(self.temp_dir.name) / "amaura.db")
+        self._attestation_patcher = patch("jarvis.amaura.evidence.verify_review_attestation", return_value=True)
+        self._attestation_patcher.start()
 
     def tearDown(self):
+        self._attestation_patcher.stop()
         self.control.close()
         self.temp_dir.cleanup()
 
@@ -173,6 +177,7 @@ class TestAmauraSupervisor(unittest.TestCase):
                 task["reviewer_id"],
                 True,
                 "Evidence sources verified.",
+                attestation={"signature": "mock", "decision": "approved", "task_id": task["id"], "reviewer_id": task["reviewer_id"]}
             )
         self.control.start_task(content_task["id"])
         self.control.submit_task(
@@ -186,6 +191,7 @@ class TestAmauraSupervisor(unittest.TestCase):
             content_task["reviewer_id"],
             True,
             "Claims verified.",
+            attestation={"signature": "mock", "decision": "approved", "task_id": content_task["id"], "reviewer_id": content_task["reviewer_id"]}
         )
         approval = self.control.store.list_approvals("pending")[0]
         self.control.store.update_work_item(

@@ -11,11 +11,19 @@ from typing import Any
 from jarvis.amaura.content_factory import ContentFactory
 from jarvis.amaura.evidence import EvidenceVault
 from jarvis.amaura.model_gateway import ModelGateway
-from jarvis.amaura.models import ApprovalStatus, GovernanceError, RiskLevel, TaskState, CanonicalTaskPacket, TaskBudget, TaskDependency, RepositoryContext
+from jarvis.amaura.models import (
+    ApprovalStatus,
+    CanonicalTaskPacket,
+    GovernanceError,
+    RepositoryContext,
+    RiskLevel,
+    TaskBudget,
+    TaskDependency,
+    TaskState,
+)
 from jarvis.amaura.pipeline import AcquisitionPipeline
-from jarvis.amaura.policies import POLICIES, policies_for
-from jarvis.amaura.policy import PolicyEngine, tool_risk_class
-from jarvis.amaura.prompts import PROMPT_VERSION
+from jarvis.amaura.policies import POLICIES
+from jarvis.amaura.policy import PolicyEngine
 from jarvis.amaura.registry import AGENTS_BY_ID, ALL_AGENTS, get_agent
 from jarvis.amaura.store import CompanyStore
 from jarvis.amaura.telemetry import OperationalTelemetry
@@ -273,13 +281,24 @@ class AmauraControlPlane:
             self._request_approval(updated, requested_by="jarvis")
         return self._task(task_id)
 
-    def review_task(self, task_id: str, actor: str, approve: bool, findings: str) -> dict[str, Any]:
+    def review_task(self, task_id: str, actor: str, approve: bool, findings: str, attestation: dict[str, Any] | None = None) -> dict[str, Any]:
         task = self._task(task_id)
         if actor != task["reviewer_id"]:
             self.store.audit(actor, "review", "task", task_id, "denied", {"expected": task["reviewer_id"]})
             raise GovernanceError(f"Independent review must be performed by '{task['reviewer_id']}'")
         if actor == task["owner_id"]:
             raise GovernanceError("No agent may certify its own work")
+        if actor != self.founder_id:
+            from jarvis.amaura.evidence import verify_review_attestation
+            if not attestation:
+                raise GovernanceError("Review attestation is required for non-founder reviewers")
+            if not verify_review_attestation(attestation):
+                raise GovernanceError("Invalid review attestation signature")
+            if attestation.get("reviewer_id") != actor or attestation.get("task_id") != task_id:
+                raise GovernanceError("Attestation does not match task and reviewer")
+            attestation_decision = attestation.get("decision") == "approved"
+            if attestation_decision != approve:
+                raise GovernanceError("Attestation decision does not match review approval")
         if task["state"] != TaskState.AWAITING_REVIEW.value:
             raise GovernanceError("Task is not awaiting independent review")
         if not findings.strip():
@@ -289,7 +308,8 @@ class AmauraControlPlane:
             self.store.publish_event("qa.rejected", task_id, {"reviewer": actor, "findings": findings})
             self.store.audit(actor, "review", "task", task_id, "rejected", {"findings": findings})
             if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
-                import os, subprocess
+                import os
+                import subprocess
                 wt_path = f"/tmp/amaura-worktrees/{task_id}"
                 if os.path.exists(wt_path):
                     subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
@@ -499,10 +519,11 @@ class AmauraControlPlane:
             raise GovernanceError(f"Employee '{agent_id}' is paused and may not receive or execute work")
 
     def _complete_task(self, task_id: str) -> dict[str, Any]:
-        task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
+        task = self.store.get_work_item(task_id)
         # P0-2: include repository_write so worktree merge/cleanup fires for builder/patch tasks.
         if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
-            import os, subprocess
+            import os
+            import subprocess
             wt_path = f"/tmp/amaura-worktrees/{task_id}"
             if os.path.exists(wt_path):
                 merge_result = subprocess.run(
@@ -518,6 +539,8 @@ class AmauraControlPlane:
                     )
                 subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
                 subprocess.run(["git", "branch", "-d", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
+                
+        task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
         event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"
         self.store.publish_event(event, task_id, {"owner": task["owner_id"], "evidence": len(task["evidence"])})
         self._roll_up(task["parent_id"])

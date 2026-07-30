@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 
 class RiskLevel(StrEnum):
@@ -102,9 +105,6 @@ class PolicyDecision:
 
 class GovernanceError(ValueError):
     """Raised when an action violates the Amaura operating doctrine."""
-
-from pydantic import BaseModel, Field
-import uuid
 
 class TaskBudget(BaseModel):
     limit_cents: int

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import logging
 import os
 import re
 import shlex
+import subprocess
+import time
 from pathlib import Path
-from typing import Any, ClassVar
+from types import SimpleNamespace
+from typing import Any, Callable, ClassVar
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.evidence import (
@@ -18,7 +23,7 @@ from jarvis.amaura.models import GovernanceError, TaskState
 from jarvis.amaura.network import fetch_public_text
 from jarvis.amaura.policy import PATH_ARGUMENTS
 from jarvis.amaura.registry import get_agent
-from jarvis.amaura.sandbox import run_governed_command
+from jarvis.amaura.sandbox import run_governed_command, StatefulDockerSandbox
 from jarvis.models import DEFAULT_MODEL, MODELS, resolve_model
 
 
@@ -99,6 +104,7 @@ class GovernedTaskRunner:
         tool_name: str,
         args: dict[str, Any],
         execute_tool,
+        sandbox: StatefulDockerSandbox | None = None,
     ) -> str:
         if tool_name == "web_fetch":
             return fetch_public_text(
@@ -153,11 +159,14 @@ class GovernedTaskRunner:
             command = str(args["command"])
         timeout = max(1, min(int(args.get("timeout", 120)), 300))
         try:
-            completed = run_governed_command(
-                command,
-                workspace=str(args["cwd"]),
-                timeout=timeout,
-            )
+            if sandbox:
+                completed = sandbox.run(command, timeout=timeout)
+            else:
+                completed = run_governed_command(
+                    command,
+                    workspace=str(args["cwd"]),
+                    timeout=timeout,
+                )
         except GovernanceError as exc:
             return f"❌ Cannot execute command: {exc}"
         output = completed.stdout
@@ -182,13 +191,14 @@ class GovernedTaskRunner:
         # P0-2: include repository_write (used by builder/patch_engineer in workflows.py)
         # in addition to software_delivery/engineering so worktrees are created correctly.
         if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and packet_dict.get("_workspace"):
-            import os
             workspace = packet_dict["_workspace"]
             if os.path.isdir(os.path.join(workspace, ".git")):
                 wt_path = f"/tmp/amaura-worktrees/{task_id}"
                 os.makedirs("/tmp/amaura-worktrees", exist_ok=True)
                 if not os.path.exists(wt_path):
-                    run_governed_command(f"git worktree add -B amaura-{task_id} {wt_path} HEAD", workspace=workspace)
+                    res = subprocess.run(["git", "worktree", "add", "-B", f"amaura-{task_id}", wt_path, "HEAD"], cwd=workspace, capture_output=True)
+                    if res.returncode != 0:
+                        raise GovernanceError(f"Failed to create git worktree: {res.stderr.decode()}")
                 packet_dict["_workspace"] = wt_path
                 packet_dict["repository_context"]["workspace_dir"] = wt_path
 
@@ -216,55 +226,67 @@ class GovernedTaskRunner:
         iterations = 0
         response = None  # holds last LLM response for model_execution_receipt (P0-8)
 
-        for iteration in range(1, max_iterations + 1):
-            iterations = iteration
-            response = client.chat_sync(model_id=model_cfg["id"], messages=messages, tools=tools if model_cfg.get("supports_tools") and tools else None)
-            choice = response.choices[0]
-            content = choice.message.content or ""
-            tool_calls = choice.message.tool_calls or []
-            if not tool_calls:
-                final_response = content.strip()
-                break
+        sandbox = None
+        if os.environ.get("AMAURA_SANDBOX_MODE", "docker").strip().lower() == "docker":
+            try:
+                sandbox = StatefulDockerSandbox(workspace=workspace)
+            except GovernanceError:
+                pass  # Fall back to run_governed_command logic if sandbox fails to start
+        
+        try:
+            for iteration in range(1, max_iterations + 1):
+                iterations = iteration
+                response = client.chat_sync(model_id=model_cfg["id"], messages=messages, tools=tools if model_cfg.get("supports_tools") and tools else None)
+                choice = response.choices[0]
+                content = choice.message.content or ""
+                tool_calls = choice.message.tool_calls or []
+                if not tool_calls:
+                    final_response = content.strip()
+                    break
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [{"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}} for call in tool_calls],
-                }
-            )
-            for call in tool_calls:
-                try:
-                    args = json.loads(call.function.arguments)
-                except json.JSONDecodeError as exc:
-                    raise GovernanceError(f"Employee produced invalid arguments for {call.function.name}") from exc
-                if call.function.name == "run_command" and not args.get("cwd"):
-                    args["cwd"] = workspace
-                scoped_args = self._scope_tool_args(call.function.name, args, workspace)
-                self.control.authorize_tool(task_id, employee.agent_id, call.function.name, scoped_args)
-                result = self._execute_tool(
-                    call.function.name,
-                    scoped_args,
-                    execute_tool,
-                )
-                record = self.control.evidence.put_text(
-                    result,
-                    source=f"task:{task_id}:tool:{call.function.name}",
-                )
-                evidence.append(
+                messages.append(
                     {
-                        "type": "tool_result",
-                        "reference": record.reference,
-                        "sha256": record.sha256,
-                        "byte_length": record.byte_length,
-                        "tool": call.function.name,
-                        "success": not result.startswith("❌"),
-                        "excerpt": result[:500],
+                        "role": "assistant",
+                        "content": content or None,
+                        "tool_calls": [{"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}} for call in tool_calls],
                     }
                 )
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-        else:
-            raise GovernanceError(f"Employee exceeded the {max_iterations}-iteration execution limit")
+                for call in tool_calls:
+                    try:
+                        args = json.loads(call.function.arguments)
+                    except json.JSONDecodeError as exc:
+                        raise GovernanceError(f"Employee produced invalid arguments for {call.function.name}") from exc
+                    if call.function.name == "run_command" and not args.get("cwd"):
+                        args["cwd"] = workspace
+                    scoped_args = self._scope_tool_args(call.function.name, args, workspace)
+                    self.control.authorize_tool(task_id, employee.agent_id, call.function.name, scoped_args)
+                    result = self._execute_tool(
+                        call.function.name,
+                        scoped_args,
+                        execute_tool,
+                        sandbox=sandbox,
+                    )
+                    record = self.control.evidence.put_text(
+                        result,
+                        source=f"task:{task_id}:tool:{call.function.name}",
+                    )
+                    evidence.append(
+                        {
+                            "type": "tool_result",
+                            "reference": record.reference,
+                            "sha256": record.sha256,
+                            "byte_length": record.byte_length,
+                            "tool": call.function.name,
+                            "success": not result.startswith("❌"),
+                            "excerpt": result[:500],
+                        }
+                    )
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            else:
+                raise GovernanceError(f"Employee exceeded the {max_iterations}-iteration execution limit")
+        finally:
+            if sandbox:
+                sandbox.close()
 
         if not final_response:
             raise GovernanceError("Employee returned no completion summary")
@@ -434,7 +456,7 @@ class GovernedReviewRunner:
             deterministic_review=deterministic,
         )
         self.control.store.record_review_attestation(attestation)
-        updated = self.control.review_task(task_id, actor=reviewer_id, approve=approve, findings=findings.strip())
+        updated = self.control.review_task(task_id, actor=reviewer_id, approve=approve, findings=findings.strip(), attestation=attestation)
         self.control.store.audit(
             reviewer_id,
             "automated_independent_review",

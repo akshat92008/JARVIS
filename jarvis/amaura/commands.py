@@ -1,7 +1,8 @@
 """Domain-Command Bus definitions for the Amaura kernel."""
 
 from __future__ import annotations
-from typing import Any, Literal, ClassVar
+
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -54,6 +55,7 @@ class ReviewTaskCommand(Command):
     actor: str
     approve: bool
     findings: str
+    attestation: dict[str, Any] | None = None
 
 
 class DecideApprovalCommand(Command):
@@ -168,7 +170,7 @@ class TransitionLeadCommand(Command):
     handler: ClassVar[str] = "transition"
     
     lead_id: str
-    stage: str
+    to_stage: str
     actor: str
     reason: str
 
@@ -183,6 +185,7 @@ class StageMessageCommand(Command):
     message_type: str
     subject: str
     body: str
+    actor: str = "outreach_writer"
 
 
 class DecideMessageCommand(Command):
@@ -191,7 +194,7 @@ class DecideMessageCommand(Command):
     
     message_id: str
     actor: str
-    decision: Literal["approved", "rejected"]
+    approve: bool
     reason: str
 
 
@@ -200,8 +203,9 @@ class ConfirmExternalSendCommand(Command):
     handler: ClassVar[str] = "confirm_external_send"
     
     message_id: str
-    provider_id: str
     provider_receipt: dict[str, Any]
+    thread_id: str | None = None
+    external_message_id: str | None = None
     actor: str
 
 
@@ -210,17 +214,16 @@ class DeliverApprovedMessageCommand(Command):
     handler: ClassVar[str] = "deliver_approved_message"
     
     message_id: str
-    provider_id: str
-    provider_receipt: dict[str, Any]
     recipient: str
     actor: str
+    adapter: Any | None = Field(default=None, exclude=True)
 
 
 class SetKillSwitchCommand(Command):
     domain: ClassVar[Literal["acquisition"]] = "acquisition"
     handler: ClassVar[str] = "set_kill_switch"
     
-    active: bool
+    enabled: bool
     actor: str
     reason: str
 
@@ -235,6 +238,7 @@ class ContentCreateCampaignCommand(Command):
     title: str
     audience: str
     business_objective: str
+    config: dict[str, Any]
 
 
 class RegisterAssetCommand(Command):
@@ -244,7 +248,11 @@ class RegisterAssetCommand(Command):
     campaign_id: str
     asset_type: str
     uri: str
-    sha256: str
+    content: bytes | None = Field(default=None, exclude=True)
+    sha256: str = ""
+    source_url: str = ""
+    creator: str = ""
+    licence: str = ""
     status: str = "draft"
     metadata: dict[str, Any] | None = None
 
@@ -257,3 +265,4 @@ class RecordMetricsCommand(Command):
     platform: str
     window: str
     metrics: dict[str, Any]
+    captured_at: str | None = None

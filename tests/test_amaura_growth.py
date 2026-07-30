@@ -54,7 +54,7 @@ class TestAmauraGrowthSystem(unittest.TestCase):
 
     def test_founder_prompts_and_expanded_workforce_are_packaged(self):
         prompts = load_prompt_catalogue()
-        self.assertEqual(len(prompts), 5)
+        self.assertGreaterEqual(len(prompts), 43)
         self.assertGreaterEqual(len(ALL_AGENTS), 40)
         self.assertIn("Never be aggressive through", prompts["chief_revenue_officer"])
         self.assertIn("Do not send messages automatically", prompts["lead_discovery_outreach"])

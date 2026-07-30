@@ -15,6 +15,7 @@ from typing import Any
 
 from jarvis.amaura.models import GovernanceError
 from jarvis.amaura.network import request_json, validate_public_url
+from jarvis.amaura.n8n import get_n8n_client
 
 Transport = Callable[..., tuple[int, dict[str, Any], dict[str, str]]]
 
@@ -217,6 +218,61 @@ class GmailAdapter:
         )
 
 
+class N8nEmailAdapter:
+    """Send one founder-approved message via n8n webhook and return a receipt."""
+    
+    def __init__(self, receipt_key: str | None = None):
+        self.client = get_n8n_client()
+        self.receipt_key = receipt_key
+        
+    @property
+    def configured(self) -> bool:
+        return os.environ.get("USE_N8N") == "1"
+        
+    def send(
+        self,
+        *,
+        recipient: str,
+        subject: str,
+        body: str,
+        idempotency_key: str,
+        sender: str = "",
+    ) -> ProviderReceipt:
+        if not self.configured:
+            raise GovernanceError("n8n is not configured")
+        
+        result = self.client.trigger_webhook(
+            os.environ.get("N8N_WEBHOOK_EMAIL", "amaura-email"),
+            {
+                "to": recipient,
+                "from": sender,
+                "subject": subject,
+                "body": body,
+                "idempotency_key": idempotency_key
+            }
+        )
+        if result.get("status") == "error":
+            raise GovernanceError(f"n8n email delivery failed: {result.get('error')}")
+            
+        external_id = str(result.get("id", idempotency_key)).strip()
+        thread_id = str(result.get("threadId", "")).strip()
+        
+        return ProviderReceipt.issue(
+            provider="n8n",
+            operation="send_email",
+            external_id=external_id,
+            thread_id=thread_id,
+            idempotency_key=idempotency_key,
+            payload={
+                "recipient": recipient,
+                "subject": subject,
+                "body": body,
+            },
+            status="sent",
+            key=self.receipt_key,
+        )
+
+
 class PrivatePublicationAdapter:
     """Create a private provider draft; it never performs a public publish."""
 
@@ -318,6 +374,7 @@ def verify_provider_receipt(
 __all__ = [
     "GmailAdapter",
     "PrivatePublicationAdapter",
+    "N8nEmailAdapter",
     "ProviderReceipt",
     "verify_provider_receipt",
 ]

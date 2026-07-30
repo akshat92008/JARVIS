@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -206,18 +205,21 @@ class TestInjectionQuarantine:
 class TestWorktreeActionType:
     def test_repository_write_in_executor(self):
         import inspect
+
         from jarvis.amaura import executor
         src = inspect.getsource(executor.GovernedTaskRunner.run)
         assert "repository_write" in src
 
     def test_repository_write_in_complete_task(self):
         import inspect
+
         from jarvis.amaura import control_plane
         src = inspect.getsource(control_plane.AmauraControlPlane._complete_task)
         assert "repository_write" in src
 
     def test_merge_failure_check_present(self):
         import inspect
+
         from jarvis.amaura import control_plane
         src = inspect.getsource(control_plane.AmauraControlPlane._complete_task)
         assert "returncode" in src, "_complete_task must inspect merge return code"
@@ -229,6 +231,7 @@ class TestWorktreeActionType:
 class TestModelExecutionReceipt:
     def test_receipt_fields_present_in_source(self):
         import inspect
+
         from jarvis.amaura import executor
         src = inspect.getsource(executor.GovernedTaskRunner.run)
         for field in ("requested_route", "actual_model", "provider", "input_tokens", "output_tokens"):
@@ -264,12 +267,14 @@ class TestReviewerKeyResolution:
 class TestJarvisSessionToken:
     def test_session_token_attribute_present_in_init(self):
         import inspect
+
         from jarvis.agent import JarvisAgent
         src = inspect.getsource(JarvisAgent.__init__)
         assert "_amaura_session_token" in src
 
     def test_tool_guard_requires_session_token(self):
         import inspect
+
         from jarvis.agent import JarvisAgent
         src = inspect.getsource(JarvisAgent._execute_tool_with_safety)
         assert "_amaura_session_token" in src

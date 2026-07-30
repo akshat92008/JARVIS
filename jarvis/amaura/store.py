@@ -85,16 +85,21 @@ class CompanyStore:
         This ensures compound operations (e.g. programme creation) are all-or-nothing.
         """
         with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            self._autocommit = False
+            nested = self._connection.in_transaction
+            if not nested:
+                self._connection.execute("BEGIN IMMEDIATE")
+                self._autocommit = False
             try:
                 yield
-                self._connection.commit()
+                if not nested:
+                    self._connection.commit()
             except Exception:
-                self._connection.rollback()
+                if not nested:
+                    self._connection.rollback()
                 raise
             finally:
-                self._autocommit = True
+                if not nested:
+                    self._autocommit = True
 
 
     def integrity_check(self) -> dict[str, Any]:
@@ -937,9 +942,7 @@ class CompanyStore:
             "metadata": {},
             **lead,
         }
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+        with self.atomic_block():
                 if daily_limit is not None:
                     count = self._connection.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=? AND created_at LIKE ?", (values["campaign_id"], f"{day_prefix}%")).fetchone()[0]
                     if count >= daily_limit:
@@ -973,11 +976,6 @@ class CompanyStore:
                         now,
                     ),
                 )
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
         return self.get_lead(values["id"])
 
     def get_lead(self, lead_id: str) -> dict[str, Any]:
@@ -1144,9 +1142,7 @@ class CompanyStore:
 
     def confirm_message_sent_atomic(self, message_id: str, *, campaign_id: str, is_followup: bool, daily_limit: int, since: str, external_message_id: str, thread_id: str | None) -> dict[str, Any]:
         """Atomically enforce a campaign cap and record provider-confirmed delivery."""
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+        with self.atomic_block():
                 message = self._connection.execute("SELECT status FROM messages WHERE id=?", (message_id,)).fetchone()
                 if message is None:
                     raise KeyError(f"Unknown message: {message_id}")
@@ -1170,11 +1166,6 @@ class CompanyStore:
                     WHERE id=?""",
                     (now, external_message_id, thread_id, now, message_id),
                 )
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
         return self.get_message(message_id)
 
     def list_messages(self, lead_id: str | None = None, status: str | None = None, since: str | None = None) -> list[dict[str, Any]]:
@@ -1272,9 +1263,7 @@ class CompanyStore:
         """Expire abandoned leases and make retryable tasks available again."""
         now = utc_now()
         recovered: list[dict[str, Any]] = []
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+        with self.atomic_block():
                 rows = self._connection.execute(
                     """SELECT * FROM execution_runs
                     WHERE state IN ('leased','running') AND lease_until<=?
@@ -1297,11 +1286,6 @@ class CompanyStore:
                         (task_state, now, "Execution lease expired; JARVIS recovered the task.", "Execution lease expired; JARVIS recovered the task.", row["task_id"]),
                     )
                     recovered.append({"run_id": row["id"], "task_id": row["task_id"], "attempt": row["attempt"], "retry_scheduled": retry})
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
         return recovered
 
     def claim_next_task(self, *, worker_id: str, lease_seconds: int = 900, max_attempts: int = 3, workflow_id: str | None = None) -> dict[str, Any] | None:
@@ -1315,9 +1299,7 @@ class CompanyStore:
         now = now_dt.isoformat()
         lease_until = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
         run_id = f"run_{uuid.uuid4().hex[:16]}"
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+        with self.atomic_block():
                 params: list[Any] = []
                 workflow_clause = ""
                 if workflow_id:
@@ -1377,11 +1359,6 @@ class CompanyStore:
                     ) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (run_id, selected["id"], worker_id.strip(), attempt, "running", lease_until, now, now, "{}"),
                 )
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
         return {"run": self._get_execution(run_id), "task": self.get_work_item(selected["id"])}
 
     def heartbeat_execution(self, run_id: str, *, worker_id: str, lease_seconds: int = 900) -> dict[str, Any]:
@@ -1401,9 +1378,7 @@ class CompanyStore:
     def finish_execution(self, run_id: str, *, worker_id: str, succeeded: bool, result: dict[str, Any] | None = None, error: str = "", retryable: bool = True, max_attempts: int = 3) -> dict[str, Any]:
         """Close a lease and deterministically retry or fail an interrupted task."""
         now = utc_now()
-        with self._lock:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
+        with self.atomic_block():
                 run = self._connection.execute("SELECT * FROM execution_runs WHERE id=?", (run_id,)).fetchone()
                 if run is None:
                     raise KeyError(f"Unknown execution run: {run_id}")
@@ -1427,11 +1402,6 @@ class CompanyStore:
                         WHERE id=? AND state='in_progress'""",
                         (task_state, now, summary, summary, run["task_id"]),
                     )
-                self._connection.commit()
-            except Exception:
-                if self._connection.in_transaction:
-                    self._connection.rollback()
-                raise
         return self._get_execution(run_id)
 
     def execution_status(self) -> dict[str, Any]:

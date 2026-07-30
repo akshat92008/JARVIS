@@ -3,6 +3,8 @@ Communication Tools — iMessage, Reminders, and email integration via AppleScri
 """
 
 import subprocess
+import os
+from jarvis.amaura.n8n import get_n8n_client
 
 
 # ── Tool Definitions ─────────────────────────────────────────────────────────
@@ -91,6 +93,14 @@ def _run_applescript(script: str) -> str:
 
 def tool_send_imessage(to: str, message: str) -> str:
     """Send an iMessage."""
+    if os.environ.get("USE_N8N") == "1":
+        client = get_n8n_client()
+        result = client.send_message(to, message)
+        if result.get("status") == "success":
+            return f"✅ iMessage sent to {to} via n8n"
+        else:
+            return f"❌ n8n error: {result.get('error', 'unknown error')}"
+
     escaped_msg = message.replace('"', '\\"')
     script = f'''
     tell application "Messages"

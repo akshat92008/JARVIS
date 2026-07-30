@@ -1,6 +1,7 @@
 """The Command Bus for the Amaura kernel. Enforces atomic execution of typed commands."""
 
 from __future__ import annotations
+
 from typing import Any
 
 from jarvis.amaura.commands import Command
@@ -17,8 +18,8 @@ class CommandBus:
     def execute(self, command: Command) -> Any:
         """Execute a typed command atomically."""
         # Resolve the domain handler
-        domain = getattr(command, "domain")
-        handler_name = getattr(command, "handler")
+        domain = command.domain
+        handler_name = command.handler
         
         if domain == "control_plane":
             handler_obj = self.control_plane

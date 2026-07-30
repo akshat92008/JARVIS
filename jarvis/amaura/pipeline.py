@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 
 from jarvis.amaura.integrations import (
     GmailAdapter,
+    N8nEmailAdapter,
+    PrivatePublicationAdapter,
     ProviderReceipt,
     verify_provider_receipt,
 )
@@ -182,7 +184,7 @@ class AcquisitionPipeline:
                     {"content_hash": digest}, {"evidence_id": evidence["id"], "security_scan": scan.to_dict()})
         return {**evidence, "security_scan": scan.to_dict()}
 
-    def score_lead(self, lead_id: str, components: dict[str, int]) -> dict:
+    def score_lead(self, lead_id: str, components: dict[str, int], *, actor: str = "") -> dict:
         if set(components) != set(SCORE_LIMITS):
             raise GovernanceError(f"Score requires exactly: {', '.join(SCORE_LIMITS)}")
         for key, maximum in SCORE_LIMITS.items():
@@ -365,7 +367,7 @@ class AcquisitionPipeline:
         *,
         recipient: str,
         actor: str,
-        adapter: GmailAdapter | None = None,
+        adapter: GmailAdapter | N8nEmailAdapter | None = None,
     ) -> dict:
         """Call Gmail once and atomically persist only its signed success receipt."""
 
@@ -401,18 +403,40 @@ class AcquisitionPipeline:
                     "Approved payload hash mismatch — message content was altered after approval"
                 )
 
-        gmail = adapter or GmailAdapter()
-        receipt = gmail.send(
-            recipient=recipient,
-            subject=message["subject"],
-            body=message["body"],
-            idempotency_key=message["idempotency_key"],
-        )
-        return self.confirm_external_send(
-            message_id,
-            actor=actor,
-            provider_receipt=receipt,
-        )
+        if message["channel"] == "email":
+            email_adapter = adapter or (N8nEmailAdapter() if os.environ.get("USE_N8N") == "1" else GmailAdapter())
+            receipt = email_adapter.send(
+                recipient=message["recipient"],
+                subject=message["subject"],
+                body=message["body"],
+                idempotency_key=message["idempotency_key"],
+            )
+            return self.confirm_external_send(
+                message_id,
+                actor=actor,
+                provider_receipt=receipt,
+            )
+        elif message["channel"] == "imessage":
+            from jarvis.tools.communication import tool_send_imessage
+            result = tool_send_imessage(message["recipient"], message["body"])
+            if result.startswith("❌"):
+                raise GovernanceError(f"iMessage delivery failed: {result}")
+            # Mock a receipt for AppleScript / n8n success since it doesn't return one
+            receipt = ProviderReceipt.issue(
+                provider="imessage",
+                operation="send_imessage",
+                external_id=message_id,
+                idempotency_key=message["idempotency_key"],
+                payload={"recipient": message["recipient"], "body": message["body"]},
+                status="sent",
+            )
+            return self.confirm_external_send(
+                message_id,
+                actor=actor,
+                provider_receipt=receipt,
+            )
+        
+        raise GovernanceError(f"Unsupported channel: {message['channel']}")
 
     def set_kill_switch(self, enabled: bool, *, actor: str, reason: str) -> dict:
         if actor not in {"jarvis", self.founder_id} or not reason.strip():

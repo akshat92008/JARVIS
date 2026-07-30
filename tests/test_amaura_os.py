@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.executor import GovernedTaskRunner
@@ -18,8 +19,11 @@ class TestAmauraCompanyOS(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.control = AmauraControlPlane(Path(self.temp_dir.name) / "amaura.db")
+        self._attestation_patcher = patch("jarvis.amaura.evidence.verify_review_attestation", return_value=True)
+        self._attestation_patcher.start()
 
     def tearDown(self):
+        self._attestation_patcher.stop()
         self.control.close()
         self.temp_dir.cleanup()
 
@@ -32,7 +36,8 @@ class TestAmauraCompanyOS(unittest.TestCase):
             evidence=[{"type": "test_report", "reference": f"artifact://{task['id']}/report"}],
         )
         return self.control.review_task(
-            task["id"], actor=task["reviewer_id"], approve=True, findings="Evidence independently verified."
+            task["id"], actor=task["reviewer_id"], approve=True, findings="Evidence independently verified.",
+            attestation={"signature": "mock", "decision": "approved", "task_id": task["id"], "reviewer_id": task["reviewer_id"]}
         )
 
     def test_bootstrap_registers_v1_workforce_under_jarvis(self):
@@ -124,7 +129,8 @@ class TestAmauraCompanyOS(unittest.TestCase):
         with self.assertRaisesRegex(GovernanceError, "Independent review"):
             self.control.review_task(first["id"], first["owner_id"], True, "Looks good to me")
         approved = self.control.review_task(
-            first["id"], first["reviewer_id"], True, "Criteria are measurable and scope is bounded."
+            first["id"], first["reviewer_id"], True, "Criteria are measurable and scope is bounded.",
+            attestation={"signature": "mock", "decision": "approved", "task_id": first["id"], "reviewer_id": first["reviewer_id"]}
         )
         self.assertEqual(approved["state"], TaskState.COMPLETED.value)
 
@@ -143,7 +149,8 @@ class TestAmauraCompanyOS(unittest.TestCase):
             [{"type": "content", "reference": "artifact://content/master-v1"}],
         )
         reviewed = self.control.review_task(
-            content_task["id"], content_task["reviewer_id"], True, "All claims trace to approved evidence."
+            content_task["id"], content_task["reviewer_id"], True, "All claims trace to approved evidence.",
+            attestation={"signature": "mock", "decision": "approved", "task_id": content_task["id"], "reviewer_id": content_task["reviewer_id"]}
         )
         self.assertEqual(reviewed["state"], TaskState.AWAITING_APPROVAL.value)
         approval = self.control.store.list_approvals("pending")[0]
