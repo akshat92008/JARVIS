@@ -15,7 +15,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from security_gate import scan_repository  # noqa: E402
+try:
+    from security_gate import scan_repository  # type: ignore[import-not-found]  # noqa: E402
+except ModuleNotFoundError:
+    from scripts.security_gate import scan_repository  # noqa: E402
 
 from jarvis.amaura.control_plane import AmauraControlPlane  # noqa: E402
 from jarvis.amaura.evaluation import evaluate_model  # noqa: E402
@@ -67,19 +70,17 @@ def _run(static_only: bool) -> dict[str, Any]:
             and all(item["ready"] for item in evaluations)
         )
     )
-    ready = (
-        bool(readiness["source_ready"])
-        and bool(security["ok"])
-        and (
-            static_only
-            or (
-                bool(readiness["ready"])
-                and model_gate
-            )
-        )
+    source_certified = bool(readiness["source_ready"]) and bool(security["ok"])
+    production_ready = (
+        source_certified
+        and not static_only
+        and bool(readiness["ready"])
+        and model_gate
     )
     return {
-        "ready": ready,
+        "ready": production_ready,
+        "source_certified": source_certified,
+        "production_ready": production_ready,
         "mode": "static" if static_only else "production",
         "readiness": readiness,
         "security": security,
@@ -104,6 +105,8 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - gate must always emit structured JSON
         report = {
             "ready": False,
+            "source_certified": False,
+            "production_ready": False,
             "mode": "static" if args.static_only else "production",
             "error": {
                 "type": type(exc).__name__,
@@ -111,7 +114,8 @@ def main() -> int:
             },
         }
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
-    return 0 if report.get("ready") else 1
+    gate_key = "source_certified" if args.static_only else "production_ready"
+    return 0 if report.get(gate_key) else 1
 
 
 if __name__ == "__main__":

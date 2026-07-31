@@ -153,6 +153,44 @@ class TestAmauraGrowthSystem(unittest.TestCase):
                 sent["id"],
             )
 
+    def test_n8n_and_imessage_receipts_confirm_matching_channels(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "AMAURA_PROVIDER_RECEIPT_KEY": (
+                    "test-provider-receipt-key-with-at-least-32-bytes"
+                )
+            },
+        ):
+            for channel, provider, operation, recipient in (
+                ("email", "n8n", "send_email", "client@example.com"),
+                ("imessage", "imessage", "send_imessage", "+15555550123"),
+            ):
+                lead = self._qualified_lead(number=10 if channel == "email" else 11)
+                message = self.pipeline.stage_message(
+                    lead["id"], recipient=recipient, channel=channel,
+                    message_type="first_contact", subject="White-label engineering",
+                    body=OUTREACH,
+                )
+                self.pipeline.decide_message(
+                    message["id"], actor=self.control.founder_id,
+                    approve=True, reason="Evidence checked",
+                )
+                receipt = ProviderReceipt.issue(
+                    provider=provider,
+                    operation=operation,
+                    external_id=f"{provider}-123",
+                    idempotency_key=message["idempotency_key"],
+                    payload={"test": True},
+                    status="sent",
+                )
+                sent = self.pipeline.confirm_external_send(
+                    message["id"],
+                    provider_receipt=receipt,
+                    actor="jarvis",
+                )
+                self.assertEqual(sent["status"], "sent")
+
     def test_opt_out_and_kill_switch_are_immediate(self):
         lead = self._qualified_lead()
         self.pipeline.transition(lead["id"], "outreach_drafted", actor="outreach_writer", reason="Draft prepared")

@@ -16,6 +16,14 @@ SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\b(?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+-]{16,}", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bghp_[A-Za-z0-9_]{36}\b"),
+    re.compile(r"\bgho_[A-Za-z0-9_]{36}\b"),
+    re.compile(r"\bghs_[A-Za-z0-9_]{36}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9]{10,}\b"),
+    re.compile(r"\bsk_live_[A-Za-z0-9]{24,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z-_]{35}\b"),
 )
 
 EXTERNAL_ACTIONS = {
@@ -42,9 +50,41 @@ TOOL_RISK_CLASSES = {
         "search_symbol",
     },
     "R1": {"web_search", "web_fetch", "read_pdf"},
-    "R2": {"write_file", "edit_file", "create_document", "create_presentation", "run_command", "run_tests"},
+    "R2": {
+        "write_file",
+        "edit_file",
+        "create_document",
+        "create_presentation",
+        "run_command",
+        "run_tests",
+        "amaura_discover_lead",
+        "amaura_record_lead_evidence",
+        "amaura_score_lead",
+        "amaura_transition_lead",
+        "amaura_stage_outreach",
+        "amaura_register_content_asset",
+        "amaura_record_content_metrics",
+    },
     "R3": {"send_email", "send_message", "schedule_post", "publish_content", "create_gmail_draft"},
     "R4": {"payment", "refund", "delete_data", "production_deploy"},
+}
+
+CAPABILITY_RULES: dict[str, set[str]] = {
+    "plan": {"amaura_create_program", "amaura_task_packet", "amaura_list_tasks", "amaura_company_status"},
+    "delegate": {"amaura_run_task", "amaura_create_program", "amaura_supervisor_tick"},
+    "pause": {"amaura_pause_agent"},
+    "escalate": {"amaura_review_task"},
+    "request_approval": {"amaura_review_task", "amaura_record_decision", "amaura_pending_approvals"},
+    "configure_campaign": {"amaura_create_campaign"},
+    "research": {"web_search", "web_fetch", "read_file", "amaura_discover_lead", "amaura_record_lead_evidence"},
+    "extract": {"amaura_record_lead_evidence"},
+    "analyse": {"amaura_score_lead", "amaura_transition_lead", "amaura_record_content_metrics"},
+    "draft_external": {"amaura_stage_outreach"},
+    "draft_public": {"amaura_register_content_asset"},
+    "download_approved_assets": {"amaura_register_content_asset"},
+    "render_media": {"amaura_register_content_asset"},
+    "approve_or_reject": {"amaura_transition_lead", "amaura_register_content_asset"},
+    "update_crm": {"amaura_transition_lead"},
 }
 
 
@@ -127,6 +167,16 @@ class PolicyEngine:
             reasons.append("Only the assigned employee may execute this task")
         if tool_name not in agent.tools:
             reasons.append(f"Tool '{tool_name}' is outside {agent.name}'s approved tool set")
+        capability_scopes = {
+            scope
+            for permission in agent.permissions
+            for scope in CAPABILITY_RULES.get(permission, set())
+        }
+        governed_business_tools = {
+            tool for tools in CAPABILITY_RULES.values() for tool in tools
+        }
+        if tool_name in governed_business_tools and tool_name not in capability_scopes:
+            reasons.append(f"Tool '{tool_name}' requires a matching agent permission scope")
         risk_class = tool_risk_class(tool_name)
         if risk_class in {"R3", "R4"}:
             reasons.append(f"{risk_class} tool '{tool_name}' must execute through an authenticated founder approval adapter")

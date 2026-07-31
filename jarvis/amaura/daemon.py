@@ -7,17 +7,17 @@ from typing import Any
 
 from jarvis import ui
 from jarvis.amaura.control_plane import AmauraControlPlane
-from jarvis.amaura.graph_supervisor import LangGraphSupervisor
+from jarvis.amaura.supervisor import AmauraSupervisor
 
 
 class AmauraDaemon:
-    """Continuously runs the graph supervisor to process tasks asynchronously."""
+    """Continuously runs the durable supervisor to process tasks asynchronously."""
 
     def __init__(self, poll_interval: int = 5):
         self.poll_interval = poll_interval
         self.running = False
         self.control = AmauraControlPlane()
-        self.supervisor = LangGraphSupervisor(self.control, worker_id="daemon")
+        self.supervisor = AmauraSupervisor(self.control, worker_id="daemon")
 
     def start(self) -> None:
         """Start the infinite polling loop."""

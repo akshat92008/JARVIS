@@ -101,6 +101,10 @@ class CompanyStore:
                 if not nested:
                     self._autocommit = True
 
+    def _commit_if_needed(self) -> None:
+        if self._autocommit:
+            self._connection.commit()
+
 
     def integrity_check(self) -> dict[str, Any]:
         """Run SQLite structural and referential integrity checks."""
@@ -477,7 +481,7 @@ class CompanyStore:
             self._ensure_column("messages", "approved_payload_hash", "TEXT NOT NULL DEFAULT ''")
             self._backfill_approval_integrity()
             self._backfill_audit_hash_chain()
-            self._connection.commit()
+            self._commit_if_needed()
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -579,7 +583,7 @@ class CompanyStore:
                 department=excluded.department, definition=excluded.definition, updated_at=excluded.updated_at""",
                 (definition["agent_id"], definition["name"], definition["department"], json.dumps(definition), now),
             )
-            self._connection.commit()
+            self._commit_if_needed()
 
     def list_agents(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -599,7 +603,7 @@ class CompanyStore:
             cursor = self._connection.execute("UPDATE agents SET enabled = ?, updated_at = ? WHERE agent_id = ?", (int(enabled), utc_now(), agent_id))
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown Amaura agent: {agent_id}")
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_agent(agent_id)
 
     def insert_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -656,7 +660,7 @@ class CompanyStore:
         with self._lock:
             self._connection.execute(f"INSERT INTO work_items({', '.join(columns)}) VALUES({placeholders})", encoded)
             if self._autocommit:
-                self._connection.commit()
+                self._commit_if_needed()
         return self.get_work_item(values["id"])
 
     def get_work_item(self, item_id: str) -> dict[str, Any]:
@@ -697,7 +701,7 @@ class CompanyStore:
             cursor = self._connection.execute(f"UPDATE work_items SET {', '.join(assignments)} WHERE id = ?", params)
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown work item: {item_id}")
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_work_item(item_id)
 
     def create_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
@@ -726,7 +730,7 @@ class CompanyStore:
                         values["expires_at"],
                     ),
                 )
-                self._connection.commit()
+                self._commit_if_needed()
             except sqlite3.IntegrityError as exc:
                 self._connection.rollback()
                 if "approvals.task_id" in str(exc):
@@ -763,7 +767,7 @@ class CompanyStore:
                 WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<=?""",
                 (utc_now(), utc_now()),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return cursor.rowcount
 
     def resolve_approval(self, approval_id: str, status: str, decided_by: str, reason: str) -> dict[str, Any]:
@@ -775,7 +779,7 @@ class CompanyStore:
                 raise ValueError(f"Approval is already {current['status']}")
             if current["expires_at"] and datetime.fromisoformat(current["expires_at"]) <= datetime.now(UTC):
                 self._connection.execute("UPDATE approvals SET status='expired',resolved_at=? WHERE id=? AND status='pending'", (utc_now(), approval_id))
-                self._connection.commit()
+                self._commit_if_needed()
                 raise ValueError("Approval has expired and must be requested again")
             cursor = self._connection.execute(
                 """UPDATE approvals SET status = ?, decided_by = ?, reason = ?, resolved_at = ?
@@ -785,14 +789,14 @@ class CompanyStore:
             if cursor.rowcount != 1:
                 latest = self.get_approval(approval_id)
                 raise ValueError(f"Approval is already {latest['status']}")
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_approval(approval_id)
 
     def publish_event(self, event_type: str, aggregate_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         created_at = utc_now()
         with self._lock:
             cursor = self._connection.execute("INSERT INTO events(event_type, aggregate_id, payload, created_at) VALUES(?, ?, ?, ?)", (event_type, aggregate_id, json.dumps(payload), created_at))
-            self._connection.commit()
+            self._commit_if_needed()
         return {"sequence": cursor.lastrowid, "event_type": event_type, "aggregate_id": aggregate_id, "payload": payload, "created_at": created_at}
 
     def list_events(self, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -821,7 +825,7 @@ class CompanyStore:
                 prev_hash,entry_hash,created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (actor, action, resource_type, resource_id, outcome, details_json, previous, entry_hash, created_at),
             )
-            self._connection.commit()
+            self._commit_if_needed()
 
     def list_audit(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
@@ -837,7 +841,7 @@ class CompanyStore:
                 (entry["id"], entry["task_id"], entry["agent_id"], entry["category"], entry["amount_cents"], entry.get("units", 0), entry.get("unit_name", ""), json.dumps(metadata), utc_now()),
             )
             self._connection.execute("UPDATE work_items SET spent_cents = spent_cents + ?, updated_at = ? WHERE id = ?", (entry["amount_cents"], utc_now(), entry["task_id"]))
-            self._connection.commit()
+            self._commit_if_needed()
 
     def upsert_knowledge(self, namespace: str, key: str, value: Any, evidence_refs: list[str], sensitivity: str, actor: str) -> None:
         with self._lock:
@@ -849,7 +853,7 @@ class CompanyStore:
                 updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
                 (namespace, key, json.dumps(value), json.dumps(evidence_refs), sensitivity, actor, utc_now()),
             )
-            self._connection.commit()
+            self._commit_if_needed()
 
     def record_decision(self, decision: dict[str, Any]) -> None:
         with self._lock:
@@ -869,7 +873,7 @@ class CompanyStore:
                     utc_now(),
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
 
     # -- Revenue pipeline -------------------------------------------------
 
@@ -902,7 +906,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_campaign(values["id"])
 
     def get_campaign(self, campaign_id: str) -> dict[str, Any]:
@@ -1044,7 +1048,7 @@ class CompanyStore:
             cursor = self._connection.execute(f"UPDATE leads SET {', '.join(assignments)} WHERE id=?", params)
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown lead: {lead_id}")
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_lead(lead_id)
 
     def add_lead_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1066,7 +1070,7 @@ class CompanyStore:
                     utc_now(),
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         with self._lock:
             row = self._connection.execute("SELECT * FROM lead_evidence WHERE id=?", (values["id"],)).fetchone()
         return self._decode_row(row)  # type: ignore[return-value]
@@ -1112,7 +1116,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_message(values["id"])
 
     def get_message(self, message_id: str) -> dict[str, Any]:
@@ -1137,7 +1141,39 @@ class CompanyStore:
             cursor = self._connection.execute(f"UPDATE messages SET {', '.join(f'{key}=?' for key in fields)} WHERE id=?", [*fields.values(), message_id])
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown message: {message_id}")
-            self._connection.commit()
+            self._commit_if_needed()
+        return self.get_message(message_id)
+
+    def mark_message_sending(self, message_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE messages SET status='sending',updated_at=?
+                WHERE id=? AND status='approved'""",
+                (now, message_id),
+            )
+            if cursor.rowcount != 1:
+                message = self.get_message(message_id)
+                if message["status"] == "sent":
+                    return message
+                raise ValueError(
+                    f"Message is {message['status']} and cannot start a new provider send"
+                )
+            self._commit_if_needed()
+        return self.get_message(message_id)
+
+    def mark_message_reconciliation_required(self, message_id: str, reason: str) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE messages SET status='reconciliation_required',updated_at=?
+                WHERE id=? AND status='sending'""",
+                (now, message_id),
+            )
+            if cursor.rowcount != 1:
+                return self.get_message(message_id)
+            self._commit_if_needed()
+        self.publish_event("message.reconciliation_required", message_id, {"reason": reason})
         return self.get_message(message_id)
 
     def confirm_message_sent_atomic(self, message_id: str, *, campaign_id: str, is_followup: bool, daily_limit: int, since: str, external_message_id: str, thread_id: str | None) -> dict[str, Any]:
@@ -1149,8 +1185,8 @@ class CompanyStore:
                 if message["status"] == "sent":
                     self._connection.rollback()
                     return self.get_message(message_id)
-                if message["status"] != "approved":
-                    raise ValueError("Only an approved message can be marked sent")
+                if message["status"] not in {"approved", "sending"}:
+                    raise ValueError("Only an approved or sending message can be marked sent")
                 comparator = "='followup'" if is_followup else "!='followup'"
                 count = self._connection.execute(
                     f"""SELECT COUNT(*) FROM messages m JOIN leads l ON l.id=m.lead_id
@@ -1189,7 +1225,7 @@ class CompanyStore:
                 "INSERT INTO pipeline_events(lead_id,campaign_id,event_type,agent,input_hash,output,created_at) VALUES(?,?,?,?,?,?,?)",
                 (lead_id, campaign_id, event_type, agent, input_hash, json.dumps(output), now),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return {"sequence": cursor.lastrowid, "lead_id": lead_id, "campaign_id": campaign_id, "event_type": event_type, "agent": agent, "input_hash": input_hash, "output": output, "created_at": now}
 
     def list_pipeline_events(self, lead_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
@@ -1209,7 +1245,7 @@ class CompanyStore:
             cursor = self._connection.execute(
                 "INSERT OR IGNORE INTO idempotency_records(idempotency_key,operation,resource_id,result_hash,created_at) VALUES(?,?,?,?,?)", (key, operation, resource_id, result_hash, utc_now())
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return cursor.rowcount == 1
 
     def get_idempotency(self, key: str) -> dict[str, Any] | None:
@@ -1224,7 +1260,7 @@ class CompanyStore:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
                 (key, value, actor, utc_now()),
             )
-            self._connection.commit()
+            self._commit_if_needed()
 
     def get_control(self, key: str, default: str = "") -> str:
         with self._lock:
@@ -1343,7 +1379,7 @@ class CompanyStore:
                     attempt = prior + 1
                     break
                 if selected is None:
-                    self._connection.commit()
+                    self._commit_if_needed()
                     return None
                 cursor = self._connection.execute(
                     """UPDATE work_items SET state='in_progress',updated_at=?
@@ -1372,7 +1408,7 @@ class CompanyStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Execution lease is no longer active or belongs to another worker")
-            self._connection.commit()
+            self._commit_if_needed()
         return self._get_execution(run_id)
 
     def finish_execution(self, run_id: str, *, worker_id: str, succeeded: bool, result: dict[str, Any] | None = None, error: str = "", retryable: bool = True, max_attempts: int = 3) -> dict[str, Any]:
@@ -1426,7 +1462,7 @@ class CompanyStore:
                 "INSERT INTO content_campaigns(id,title,audience,business_objective,status,config,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 (values["id"], values["title"], values["audience"], values["business_objective"], values["status"], json.dumps(values["config"]), now, now),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         return self.get_content_campaign(values["id"])
 
     def get_content_campaign(self, campaign_id: str) -> dict[str, Any]:
@@ -1459,7 +1495,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         with self._lock:
             row = self._connection.execute("SELECT * FROM content_assets WHERE id=?", (values["id"],)).fetchone()
         return self._decode_row(row)  # type: ignore[return-value]
@@ -1477,7 +1513,7 @@ class CompanyStore:
                 captured_at=excluded.captured_at,metrics=excluded.metrics""",
                 (entry["id"], entry["campaign_id"], entry["platform"], entry["window"], entry.get("captured_at", utc_now()), json.dumps(entry["metrics"])),
             )
-            self._connection.commit()
+            self._commit_if_needed()
         with self._lock:
             row = self._connection.execute("SELECT * FROM content_metrics WHERE campaign_id=? AND platform=? AND window=?", (entry["campaign_id"], entry["platform"], entry["window"])).fetchone()
         return self._decode_row(row)  # type: ignore[return-value]
@@ -1512,7 +1548,7 @@ class CompanyStore:
                     attestation["created_at"],
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
             row = self._connection.execute(
                 "SELECT * FROM review_attestations WHERE id=?",
                 (identifier,),
@@ -1574,7 +1610,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
             row = self._connection.execute(
                 "SELECT * FROM operational_metrics WHERE name=? AND labels_key=?",
                 (name, labels_key),
@@ -1609,7 +1645,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
             row = self._connection.execute(
                 "SELECT * FROM operational_traces WHERE id=?",
                 (trace["id"],),
@@ -1648,7 +1684,7 @@ class CompanyStore:
                     now,
                 ),
             )
-            self._connection.commit()
+            self._commit_if_needed()
             row = self._connection.execute(
                 "SELECT * FROM operational_alerts WHERE id=?",
                 (alert["id"],),
@@ -1691,7 +1727,7 @@ class CompanyStore:
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown or resolved alert: {alert_id}")
-            self._connection.commit()
+            self._commit_if_needed()
             row = self._connection.execute(
                 "SELECT * FROM operational_alerts WHERE id=?",
                 (alert_id,),

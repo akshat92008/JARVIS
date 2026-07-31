@@ -158,7 +158,7 @@ def production_readiness(
     source_checks = {
         "database_integrity": bool(database["ok"]),
         "tamper_evident_audit_chain": bool(database["audit_chain"]["ok"]),
-        "workforce_registry": len(ALL_AGENTS) == 43 and not duplicate_agents,
+        "workforce_registry": len(ALL_AGENTS) >= 43 and not duplicate_agents,
         "workforce_tool_contract": not missing_tools,
         "reviewer_contract": not invalid_reviewers,
         "workflow_catalogue": {
@@ -257,8 +257,8 @@ def production_readiness(
         name for name, passed in source_checks.items() if not passed
     ]
     return {
-        "ready": not blockers,
-        "source_ready": not source_blockers,
+        "production_ready": not blockers,
+        "source_certified": not source_blockers,
         "core_operational": all(
             source_checks[name]
             for name in (

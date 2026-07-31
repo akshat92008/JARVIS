@@ -296,7 +296,7 @@ class AmauraControlPlane:
                 raise GovernanceError("Invalid review attestation signature")
             if attestation.get("reviewer_id") != actor or attestation.get("task_id") != task_id:
                 raise GovernanceError("Attestation does not match task and reviewer")
-            attestation_decision = attestation.get("decision") == "approved"
+            attestation_decision = self._attestation_approves(attestation)
             if attestation_decision != approve:
                 raise GovernanceError("Attestation decision does not match review approval")
         if task["state"] != TaskState.AWAITING_REVIEW.value:
@@ -325,6 +325,13 @@ class AmauraControlPlane:
             self._request_approval(updated, requested_by="jarvis")
             return self._task(task_id)
         return self._complete_task(task_id)
+
+    @staticmethod
+    def _attestation_approves(attestation: dict[str, Any]) -> bool:
+        decision = attestation.get("decision")
+        if not isinstance(decision, dict) or not isinstance(decision.get("approve"), bool):
+            raise GovernanceError("Review attestation decision must include boolean 'approve'")
+        return decision["approve"]
 
     def _request_approval(self, task: dict[str, Any], requested_by: str) -> dict[str, Any]:
         self.store.expire_stale_approvals()

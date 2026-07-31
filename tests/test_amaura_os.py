@@ -37,7 +37,7 @@ class TestAmauraCompanyOS(unittest.TestCase):
         )
         return self.control.review_task(
             task["id"], actor=task["reviewer_id"], approve=True, findings="Evidence independently verified.",
-            attestation={"signature": "mock", "decision": "approved", "task_id": task["id"], "reviewer_id": task["reviewer_id"]}
+            attestation={"signature": "mock", "decision": {"approve": True}, "task_id": task["id"], "reviewer_id": task["reviewer_id"]}
         )
 
     def test_bootstrap_registers_v1_workforce_under_jarvis(self):
@@ -130,7 +130,7 @@ class TestAmauraCompanyOS(unittest.TestCase):
             self.control.review_task(first["id"], first["owner_id"], True, "Looks good to me")
         approved = self.control.review_task(
             first["id"], first["reviewer_id"], True, "Criteria are measurable and scope is bounded.",
-            attestation={"signature": "mock", "decision": "approved", "task_id": first["id"], "reviewer_id": first["reviewer_id"]}
+            attestation={"signature": "mock", "decision": {"approve": True}, "task_id": first["id"], "reviewer_id": first["reviewer_id"]}
         )
         self.assertEqual(approved["state"], TaskState.COMPLETED.value)
 
@@ -150,7 +150,7 @@ class TestAmauraCompanyOS(unittest.TestCase):
         )
         reviewed = self.control.review_task(
             content_task["id"], content_task["reviewer_id"], True, "All claims trace to approved evidence.",
-            attestation={"signature": "mock", "decision": "approved", "task_id": content_task["id"], "reviewer_id": content_task["reviewer_id"]}
+            attestation={"signature": "mock", "decision": {"approve": True}, "task_id": content_task["id"], "reviewer_id": content_task["reviewer_id"]}
         )
         self.assertEqual(reviewed["state"], TaskState.AWAITING_APPROVAL.value)
         approval = self.control.store.list_approvals("pending")[0]

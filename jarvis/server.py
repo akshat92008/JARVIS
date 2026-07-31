@@ -149,6 +149,7 @@ class AmauraReviewRequest(BaseModel):
     reviewer_id: str
     approve: bool
     findings: str
+    attestation: dict | None = None
 
 class AmauraApprovalRequest(BaseModel):
     decision: str
@@ -195,6 +196,7 @@ class AmauraTransitionRequest(BaseModel):
     reason: str
 
 class AmauraMessageRequest(BaseModel):
+    recipient: str
     channel: str
     message_type: str
     subject: str = ""
@@ -644,7 +646,7 @@ async def amaura_review_task(
         )
         reviewer_id = req.reviewer_id
     try:
-        return _amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=reviewer_id, approve=req.approve, findings=req.findings))
+        return _amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=reviewer_id, approve=req.approve, findings=req.findings, attestation=req.attestation))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -866,21 +868,16 @@ async def amaura_register_content_asset(campaign_id: str, req: AmauraContentAsse
                                         operator_key: str = Header(default="", alias="X-Amaura-Operator-Key")):
     _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
     try:
-        metadata = req.metadata.copy()
-        if req.source_url:
-            metadata["source_url"] = req.source_url
-        if req.creator:
-            metadata["creator"] = req.creator
-        if req.licence:
-            metadata["licence"] = req.licence
-            
         return _amaura_bus().execute(cmd.RegisterAssetCommand(
             campaign_id=campaign_id,
             asset_type=req.asset_type,
             uri=req.uri,
             sha256=req.sha256,
+            source_url=req.source_url,
+            creator=req.creator,
+            licence=req.licence,
             status=req.status,
-            metadata=metadata
+            metadata=req.metadata,
         ))
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

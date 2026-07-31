@@ -311,12 +311,13 @@ AMAURA_TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "lead_id": {"type": "string"},
+                    "recipient": {"type": "string"},
                     "channel": {"type": "string"},
                     "message_type": {"type": "string"},
                     "subject": {"type": "string"},
                     "body": {"type": "string"}
                 },
-                "required": ["lead_id", "channel", "message_type", "subject", "body"],
+                "required": ["lead_id", "recipient", "channel", "message_type", "subject", "body"],
             },
         },
     },
@@ -338,6 +339,24 @@ AMAURA_TOOL_DEFINITIONS = [
                     "status": {"type": "string"}
                 },
                 "required": ["campaign_id", "asset_type", "uri"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "amaura_record_content_metrics",
+            "description": "Record governed content performance metrics for a measured window.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "campaign_id": {"type": "string"},
+                    "platform": {"type": "string"},
+                    "window": {"type": "string", "enum": ["24h", "72h", "7d", "30d"]},
+                    "metrics": {"type": "object"},
+                    "captured_at": {"type": "string"}
+                },
+                "required": ["campaign_id", "platform", "window", "metrics"],
             },
         },
     },
@@ -489,26 +508,32 @@ def record_lead_evidence(lead_id: str, claim_type: str, claim: str, source_url: 
 
 
 def transition_lead(lead_id: str, to_stage: str, reason: str) -> str:
-    return _json(get_amaura_bus().execute(cmd.TransitionLeadCommand(lead_id=lead_id, stage=to_stage, actor="jarvis", reason=reason)))
+    return _json(get_amaura_bus().execute(cmd.TransitionLeadCommand(lead_id=lead_id, to_stage=to_stage, actor="jarvis", reason=reason)))
 
 
-def stage_outreach(lead_id: str, channel: str, message_type: str, subject: str, body: str) -> str:
+def stage_outreach(lead_id: str, recipient: str, channel: str, message_type: str, subject: str, body: str) -> str:
     return _json(get_amaura_bus().execute(cmd.StageMessageCommand(
-        lead_id=lead_id, recipient="", channel=channel, message_type=message_type, subject=subject, body=body
+        lead_id=lead_id, recipient=recipient, channel=channel, message_type=message_type, subject=subject, body=body
     )))
 
 
 def register_content_asset(campaign_id: str, asset_type: str, uri: str, sha256: str = "", source_url: str = "", creator: str = "", licence: str = "", status: str = "draft") -> str:
     return _json(get_amaura_bus().execute(cmd.RegisterAssetCommand(
-        campaign_id=campaign_id, asset_type=asset_type, uri=uri, sha256=sha256, status=status, metadata={
-            "source_url": source_url, "creator": creator, "licence": licence
-        }
+        campaign_id=campaign_id, asset_type=asset_type, uri=uri, sha256=sha256,
+        source_url=source_url, creator=creator, licence=licence, status=status,
+    )))
+
+
+def record_content_metrics(campaign_id: str, platform: str, window: str, metrics: dict, captured_at: str = "") -> str:
+    return _json(get_amaura_bus().execute(cmd.RecordMetricsCommand(
+        campaign_id=campaign_id, platform=platform, window=window,
+        metrics=metrics, captured_at=captured_at or None,
     )))
 
 
 def send_email(message_id: str, recipient: str) -> str:
     return _json(get_amaura_bus().execute(cmd.DeliverApprovedMessageCommand(
-        message_id=message_id, recipient=recipient
+        message_id=message_id, recipient=recipient, actor="jarvis"
     )))
 
 
@@ -541,6 +566,7 @@ AMAURA_DISPATCH = {
     "amaura_transition_lead": transition_lead,
     "amaura_stage_outreach": stage_outreach,
     "amaura_register_content_asset": register_content_asset,
+    "amaura_record_content_metrics": record_content_metrics,
     "amaura_send_email": send_email,
     "amaura_update_crm": update_crm,
 }

@@ -227,11 +227,21 @@ class GovernedTaskRunner:
         response = None  # holds last LLM response for model_execution_receipt (P0-8)
 
         sandbox = None
-        if os.environ.get("AMAURA_SANDBOX_MODE", "docker").strip().lower() == "docker":
+        sandbox_mode = os.environ.get("AMAURA_SANDBOX_MODE", "docker").strip().lower()
+        if sandbox_mode == "docker":
             try:
                 sandbox = StatefulDockerSandbox(workspace=workspace)
-            except GovernanceError:
-                pass  # Fall back to run_governed_command logic if sandbox fails to start
+            except GovernanceError as exc:
+                sandbox_error = str(exc)
+                record = self.control.evidence.put_text(sandbox_error, source=f"task:{task_id}:sandbox_init_failure")
+                evidence.append({
+                    "type": "sandbox_init_failure",
+                    "reference": record.reference,
+                    "sha256": record.sha256,
+                    "byte_length": record.byte_length,
+                    "success": False,
+                    "excerpt": sandbox_error[:500],
+                })
         
         try:
             for iteration in range(1, max_iterations + 1):
@@ -317,6 +327,8 @@ class GovernedTaskRunner:
             "actual_model": getattr(response, "model", route["model_key"]) if response is not None else route["model_key"],
             "provider": route["provider"],
             "fallback_model_key": route.get("fallback_model_key"),
+            "sandbox_mode": sandbox_mode,
+            "container_id": getattr(sandbox, "container_id", None) if sandbox else None,
             "input_tokens": getattr(last_usage, "prompt_tokens", 0) if last_usage else 0,
             "output_tokens": getattr(last_usage, "completion_tokens", 0) if last_usage else 0,
             "estimated_cost_cents": estimated_cost,

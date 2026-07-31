@@ -83,6 +83,12 @@ SCORE_LIMITS = {
     "portfolio_match": 15,
 }
 
+ALLOWED_RECEIPTS: dict[str, set[str]] = {
+    "gmail": {"send_email"},
+    "n8n": {"send_email"},
+    "imessage": {"send_imessage"},
+}
+
 
 def normalize_domain(value: str) -> str:
     candidate = value.strip().lower()
@@ -314,14 +320,24 @@ class AcquisitionPipeline:
             raise GovernanceError("Only an approved message can be marked sent")
         provider_name = "manual-break-glass"
         if provider_receipt is not None:
+            raw_receipt = (
+                provider_receipt
+                if isinstance(provider_receipt, ProviderReceipt)
+                else ProviderReceipt.from_dict(provider_receipt)
+            )
+            allowed_operations = ALLOWED_RECEIPTS.get(raw_receipt.provider, set())
+            if raw_receipt.operation not in allowed_operations:
+                raise GovernanceError(
+                    "Provider receipt operation is not allowed for this provider"
+                )
             receipt = verify_provider_receipt(
-                provider_receipt,
-                expected_operation="send_email",
+                raw_receipt,
+                expected_operation=raw_receipt.operation,
                 expected_idempotency_key=message["idempotency_key"],
             )
-            if receipt.status != "sent" or receipt.provider != "gmail":
+            if receipt.status != "sent":
                 raise GovernanceError(
-                    "Only a signed Gmail sent receipt can confirm outreach"
+                    "Only a signed sent receipt can confirm outreach"
                 )
             external_message_id = receipt.external_id
             thread_id = receipt.thread_id
@@ -374,6 +390,10 @@ class AcquisitionPipeline:
         message = self.store.get_message(message_id)
         if message["status"] == "sent":
             return message
+        if message["status"] in {"sending", "reconciliation_required"}:
+            raise GovernanceError(
+                "Message has an unresolved provider attempt and requires reconciliation before retry"
+            )
         if message["status"] != "approved":
             raise GovernanceError("Only an approved message can be delivered")
 
@@ -403,40 +423,46 @@ class AcquisitionPipeline:
                     "Approved payload hash mismatch — message content was altered after approval"
                 )
 
-        if message["channel"] == "email":
-            email_adapter = adapter or (N8nEmailAdapter() if os.environ.get("USE_N8N") == "1" else GmailAdapter())
-            receipt = email_adapter.send(
-                recipient=message["recipient"],
-                subject=message["subject"],
-                body=message["body"],
-                idempotency_key=message["idempotency_key"],
-            )
-            return self.confirm_external_send(
+        self.store.mark_message_sending(message_id)
+        try:
+            if message["channel"] == "email":
+                email_adapter = adapter or (N8nEmailAdapter() if os.environ.get("USE_N8N") == "1" else GmailAdapter())
+                receipt = email_adapter.send(
+                    recipient=message["recipient"],
+                    subject=message["subject"],
+                    body=message["body"],
+                    idempotency_key=message["idempotency_key"],
+                )
+                return self.confirm_external_send(
+                    message_id,
+                    actor=actor,
+                    provider_receipt=receipt,
+                )
+            if message["channel"] == "imessage":
+                from jarvis.tools.communication import tool_send_imessage
+                result = tool_send_imessage(message["recipient"], message["body"])
+                if result.startswith("❌"):
+                    raise GovernanceError(f"iMessage delivery failed: {result}")
+                receipt = ProviderReceipt.issue(
+                    provider="imessage",
+                    operation="send_imessage",
+                    external_id=message_id,
+                    idempotency_key=message["idempotency_key"],
+                    payload={"recipient": message["recipient"], "body": message["body"]},
+                    status="sent",
+                )
+                return self.confirm_external_send(
+                    message_id,
+                    actor=actor,
+                    provider_receipt=receipt,
+                )
+            raise GovernanceError(f"Unsupported channel: {message['channel']}")
+        except Exception as exc:
+            self.store.mark_message_reconciliation_required(
                 message_id,
-                actor=actor,
-                provider_receipt=receipt,
+                f"{type(exc).__name__}: {exc}",
             )
-        elif message["channel"] == "imessage":
-            from jarvis.tools.communication import tool_send_imessage
-            result = tool_send_imessage(message["recipient"], message["body"])
-            if result.startswith("❌"):
-                raise GovernanceError(f"iMessage delivery failed: {result}")
-            # Mock a receipt for AppleScript / n8n success since it doesn't return one
-            receipt = ProviderReceipt.issue(
-                provider="imessage",
-                operation="send_imessage",
-                external_id=message_id,
-                idempotency_key=message["idempotency_key"],
-                payload={"recipient": message["recipient"], "body": message["body"]},
-                status="sent",
-            )
-            return self.confirm_external_send(
-                message_id,
-                actor=actor,
-                provider_receipt=receipt,
-            )
-        
-        raise GovernanceError(f"Unsupported channel: {message['channel']}")
+            raise
 
     def set_kill_switch(self, enabled: bool, *, actor: str, reason: str) -> dict:
         if actor not in {"jarvis", self.founder_id} or not reason.strip():

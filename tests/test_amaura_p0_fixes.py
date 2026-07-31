@@ -86,6 +86,17 @@ class TestProtectedToolRegistry:
         assert "amaura_read_evidence" in AMAURA_PROTECTED_TOOLS
         assert "amaura_get_campaign_context" in AMAURA_PROTECTED_TOOLS
 
+    def test_business_tool_schema_requires_recipient_and_metrics_dispatch(self):
+        from jarvis.tools.amaura import AMAURA_DISPATCH, AMAURA_TOOL_DEFINITIONS
+        definitions = {
+            item["function"]["name"]: item["function"]
+            for item in AMAURA_TOOL_DEFINITIONS
+        }
+        stage = definitions["amaura_stage_outreach"]["parameters"]
+        assert "recipient" in stage["required"]
+        assert "recipient" in stage["properties"]
+        assert "amaura_record_content_metrics" in AMAURA_DISPATCH
+
 
 # ── Fix 3 (P0-6): Message recipient binding ───────────────────────────────────
 
@@ -174,6 +185,33 @@ class TestMessageRecipientBinding:
         )
         updated = pipeline.decide_message(msg["id"], actor="founder_test", approve=True, reason="OK")
         assert updated.get("approved_payload_hash"), "approved_payload_hash must be set after approval"
+
+    def test_provider_failure_requires_reconciliation_before_retry(self, tmp_path):
+        from jarvis.amaura.models import GovernanceError
+
+        class FailingAdapter:
+            def send(self, **kwargs):
+                raise TimeoutError("provider outcome unknown")
+
+        pipeline = self._make_pipeline(tmp_path)
+        lead = self._seed_qualified_lead(pipeline)
+        msg = pipeline.stage_message(
+            lead["id"], recipient="alice@acme.com", channel="email",
+            message_type="first_contact", subject="Hello",
+            body=" ".join(["word"] * 100),
+        )
+        pipeline.decide_message(msg["id"], actor="founder_test", approve=True, reason="OK")
+        with pytest.raises(TimeoutError):
+            pipeline.deliver_approved_message(
+                msg["id"], recipient="alice@acme.com", actor="outreach_agent",
+                adapter=FailingAdapter(),
+            )
+        assert pipeline.store.get_message(msg["id"])["status"] == "reconciliation_required"
+        with pytest.raises(GovernanceError, match="requires reconciliation"):
+            pipeline.deliver_approved_message(
+                msg["id"], recipient="alice@acme.com", actor="outreach_agent",
+                adapter=FailingAdapter(),
+            )
 
 
 # ── Fix 4 (Priority-1): Prompt-injection quarantine ──────────────────────────
@@ -294,13 +332,58 @@ class TestProgrammeAtomicity:
                     "id": "prog_atomic_test", "item_type": "programme",
                     "title": "T", "owner_id": "jarvis", "state": "assigned",
                 })
+                store.publish_event("programme.created", "prog_atomic_test", {"phase": "test"})
+                store.audit("jarvis", "create", "programme", "prog_atomic_test", "allowed", {})
                 raise RuntimeError("policy failure mid-creation")
         except RuntimeError:
             pass
         after = store._connection.execute("SELECT count(*) FROM work_items").fetchone()[0]
+        events = store._connection.execute("SELECT count(*) FROM events").fetchone()[0]
+        audit = store._connection.execute("SELECT count(*) FROM audit_logs").fetchone()[0]
         assert after == before, "atomic_block must roll back partial inserts on exception"
+        assert events == 0, "atomic_block must roll back events created inside it"
+        assert audit == 0, "atomic_block must roll back audit records created inside it"
 
     def test_sqlite_busy_timeout_set(self, tmp_path):
         store = _store(tmp_path)
         timeout = store._connection.execute("PRAGMA busy_timeout").fetchone()[0]
         assert timeout == 5000, f"Expected busy_timeout=5000, got {timeout}"
+
+
+class TestLaunchRuntimeRouting:
+    def test_daemon_uses_durable_supervisor(self):
+        import inspect
+        from jarvis.amaura import daemon
+
+        src = inspect.getsource(daemon)
+        assert "AmauraSupervisor" in src
+        assert "LangGraphSupervisor" not in src
+
+
+class TestCapabilityEnforcement:
+    def test_business_tools_require_matching_permission_scope(self):
+        from jarvis.amaura.policy import PolicyEngine
+
+        task = {
+            "id": "task_capability",
+            "owner_id": "lead_scout",
+            "state": "in_progress",
+            "risk": "low",
+            "action_type": "lead_discovery",
+            "metadata": {},
+        }
+        allowed = PolicyEngine.validate_tool_action(
+            task,
+            "lead_scout",
+            "amaura_discover_lead",
+            {"campaign_id": "c", "company_name": "Acme", "domain": "acme.com", "source_url": "https://acme.com"},
+        )
+        assert allowed.allowed
+        denied = PolicyEngine.validate_tool_action(
+            task,
+            "lead_scout",
+            "amaura_stage_outreach",
+            {"lead_id": "lead", "recipient": "a@example.com", "channel": "email", "message_type": "first_contact", "body": "x"},
+        )
+        assert not denied.allowed
+        assert any("permission scope" in reason for reason in denied.reasons)

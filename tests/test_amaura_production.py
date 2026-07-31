@@ -115,6 +115,49 @@ class TestAmauraProductionControls(unittest.TestCase):
             verify_review_attestation(attestation, key=ATTESTATION_KEY)
         )
 
+    def test_review_task_accepts_real_object_decision_attestation(self):
+        with patch.dict(os.environ, {"AMAURA_REVIEW_ATTESTATION_KEY": ATTESTATION_KEY}):
+            control = AmauraControlPlane(Path(tempfile.mkdtemp()) / "amaura.db")
+            try:
+                created = control.create_program(
+                    objective="Verify review contract",
+                    success_metric="Object decision attestations approve tasks",
+                    workflow_key="software_delivery",
+                )
+                task = created["tasks"][0]
+                control.start_task(task["id"], actor="jarvis")
+                control.submit_task(
+                    task["id"],
+                    actor=task["owner_id"],
+                    summary="All criteria are met.",
+                    evidence=[{"type": "test_report", "reference": "artifact://review-contract"}],
+                )
+                decision = {
+                    "approve": True,
+                    "findings": "Evidence independently verified.",
+                    "criteria": [],
+                }
+                attestation = create_review_attestation(
+                    task_id=task["id"],
+                    reviewer_id=task["reviewer_id"],
+                    reviewer_model="reviewer-model",
+                    decision=decision,
+                    deterministic_review={
+                        "approve": True,
+                        "submission_sha256": "b" * 64,
+                    },
+                )
+                updated = control.review_task(
+                    task["id"],
+                    actor=task["reviewer_id"],
+                    approve=True,
+                    findings=decision["findings"],
+                    attestation=attestation,
+                )
+                self.assertIn(updated["state"], {"completed", "awaiting_approval"})
+            finally:
+                control.close()
+
     def test_provider_receipt_binds_operation_idempotency_and_payload(self):
         payload = {"recipient": "client@example.com", "body": "Approved"}
         receipt = ProviderReceipt.issue(
@@ -291,6 +334,24 @@ class TestAmauraProductionControls(unittest.TestCase):
         self.assertTrue(report["source_ready"])
         self.assertEqual(report["source_blockers"], [])
         self.assertEqual(report["live_checks"], {})
+
+    def test_static_release_gate_uses_source_certified_not_ready(self):
+        from scripts.release_gate import _run
+
+        with patch.dict(
+            os.environ,
+            {
+                "AMAURA_MODEL_MODE": "local",
+                "AMAURA_LOCAL_MODEL": "worker-model",
+                "AMAURA_LOCAL_REVIEW_MODEL": "reviewer-model",
+                "AMAURA_SANDBOX_MODE": "docker",
+            },
+        ):
+            report = _run(static_only=True)
+        self.assertIn("source_certified", report)
+        self.assertIn("production_ready", report)
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["production_ready"])
 
     def test_review_models_must_be_distinct_for_production(self):
         with tempfile.TemporaryDirectory() as directory:
