@@ -23,6 +23,7 @@ from jarvis.amaura.models import GovernanceError, TaskState
 from jarvis.amaura.network import fetch_public_text
 from jarvis.amaura.policy import PATH_ARGUMENTS
 from jarvis.amaura.registry import get_agent
+from jarvis.amaura.security import redact_sensitive_text
 from jarvis.amaura.sandbox import run_governed_command, StatefulDockerSandbox
 from jarvis.models import DEFAULT_MODEL, MODELS, resolve_model
 
@@ -279,6 +280,7 @@ class GovernedTaskRunner:
                         execute_tool,
                         sandbox=sandbox,
                     )
+                    result = redact_sensitive_text(result)
                     record = self.control.evidence.put_text(
                         result,
                         source=f"task:{task_id}:tool:{call.function.name}",
@@ -311,8 +313,34 @@ class GovernedTaskRunner:
             if sandbox:
                 sandbox.close()
 
-        if not final_response:
+        if not final_response.strip():
             raise GovernanceError("Employee returned no completion summary")
+
+        if task["action_type"] in {"software_delivery", "engineering", "repository_write"}:
+            wt_path = f"/tmp/amaura-worktrees/{task_id}"
+            if os.path.exists(wt_path):
+                status_res = subprocess.run(["git", "status", "--porcelain"], cwd=wt_path, capture_output=True, text=True)
+                if status_res.stdout.strip():
+                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True)
+                    commit_msg = f"feat(amaura): {task.get('title', 'software update')} [{task_id}]"
+                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True)
+                rev_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt_path, capture_output=True, text=True)
+                rev = rev_res.stdout.strip()
+                diff_res = subprocess.run(["git", "diff", "HEAD~1"], cwd=wt_path, capture_output=True, text=True)
+                diff = diff_res.stdout or "Worktree commit created successfully."
+                commit_record = self.control.evidence.put_text(
+                    f"Commit: {rev}\n\nDiff:\n{diff[:5000]}",
+                    source=f"task:{task_id}:git_commit",
+                )
+                evidence.append({
+                    "type": "git_commit",
+                    "reference": commit_record.reference,
+                    "sha256": commit_record.sha256,
+                    "byte_length": commit_record.byte_length,
+                    "success": True,
+                    "excerpt": f"commit={rev[:8]} diff_len={len(diff)}",
+                })
+
         if not evidence:
             if task.get("acceptance_criteria"):
                 raise GovernanceError("Employee submitted no verifiable evidence to satisfy acceptance criteria. Agent prose is insufficient.")

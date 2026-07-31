@@ -70,22 +70,66 @@ TOOL_RISK_CLASSES = {
     "R4": {"payment", "refund", "delete_data", "production_deploy"},
 }
 
+FORBIDDEN_FILE_PATTERNS = (
+    re.compile(r"(^|[/\\])\.env(\..+)?$", re.IGNORECASE),
+    re.compile(r".*\.(pem|key|p12|pfx|asc|gpg)$", re.IGNORECASE),
+    re.compile(r"(^|[/\\])credentials\.[^/\\]+$", re.IGNORECASE),
+    re.compile(r"(^|[/\\])service[-_]account.*\.json$", re.IGNORECASE),
+    re.compile(r"(^|[/\\])\.(aws|ssh|gnupg|docker)([/\\]|$)", re.IGNORECASE),
+    re.compile(r"(^|[/\\])\.?(npmrc|pypirc|netrc)$", re.IGNORECASE),
+)
+
 CAPABILITY_RULES: dict[str, set[str]] = {
-    "plan": {"amaura_create_program", "amaura_task_packet", "amaura_list_tasks", "amaura_company_status"},
+    "plan": {
+        "amaura_create_program", "amaura_task_packet", "amaura_list_tasks", "amaura_company_status",
+        "read_file", "search_code", "get_project_structure", "web_search", "create_document"
+    },
     "delegate": {"amaura_run_task", "amaura_create_program", "amaura_supervisor_tick"},
     "pause": {"amaura_pause_agent"},
     "escalate": {"amaura_review_task"},
-    "request_approval": {"amaura_review_task", "amaura_record_decision", "amaura_pending_approvals"},
-    "configure_campaign": {"amaura_create_campaign"},
-    "research": {"web_search", "web_fetch", "read_file", "amaura_discover_lead", "amaura_record_lead_evidence"},
-    "extract": {"amaura_record_lead_evidence"},
-    "analyse": {"amaura_score_lead", "amaura_transition_lead", "amaura_record_content_metrics"},
-    "draft_external": {"amaura_stage_outreach"},
-    "draft_public": {"amaura_register_content_asset"},
-    "download_approved_assets": {"amaura_register_content_asset"},
-    "render_media": {"amaura_register_content_asset"},
-    "approve_or_reject": {"amaura_transition_lead", "amaura_register_content_asset"},
-    "update_crm": {"amaura_transition_lead", "amaura_update_crm"},
+    "request_approval": {"amaura_review_task", "amaura_record_decision", "amaura_pending_approvals", "read_file"},
+    "configure_campaign": {"amaura_create_campaign", "read_file", "recall_memory"},
+    "research": {
+        "web_search", "web_fetch", "read_file", "read_pdf", "amaura_discover_lead", "amaura_record_lead_evidence",
+        "search_code", "find_files", "get_project_structure", "amaura_register_content_asset"
+    },
+    "extract": {"amaura_record_lead_evidence", "web_fetch", "read_file"},
+    "analyse": {
+        "amaura_score_lead", "amaura_transition_lead", "amaura_record_content_metrics",
+        "read_file", "recall_memory", "analyze_code", "web_search", "web_fetch", "amaura_company_status", "amaura_list_tasks"
+    },
+    "draft": {"read_file", "create_document", "write_file"},
+    "draft_external": {"amaura_stage_outreach", "read_file", "create_document", "amaura_register_content_asset"},
+    "draft_public": {"amaura_register_content_asset", "read_file", "create_document", "create_presentation", "run_command"},
+    "download_approved_assets": {"amaura_register_content_asset", "web_search", "web_fetch", "read_file"},
+    "render_media": {"amaura_register_content_asset", "read_file", "run_command"},
+    "approve_or_reject": {
+        "amaura_transition_lead", "amaura_register_content_asset", "read_file", "search_code",
+        "run_tests", "lint_code", "analyze_code", "git_diff", "recall_memory"
+    },
+    "update_crm": {"amaura_transition_lead", "amaura_update_crm", "read_file", "write_file"},
+    "read_crm": {"read_file", "write_file", "amaura_transition_lead"},
+    "recommend": {"read_file", "recall_memory", "web_fetch", "search_code", "get_project_structure", "analyze_code"},
+    "define_acceptance_criteria": {"read_file", "search_code", "get_project_structure"},
+    "analyse_repo": {"read_file", "search_code", "get_project_structure", "analyze_code"},
+    "author_adr": {"read_file", "search_code", "get_project_structure", "analyze_code"},
+    "read_repo": {"read_file", "search_code", "find_files", "get_project_structure", "index_codebase_ast", "search_symbol"},
+    "index_repo": {"index_codebase_ast", "search_symbol", "read_file", "search_code", "find_files", "get_project_structure"},
+    "write_branch": {"write_file", "run_command", "run_tests", "read_file", "search_code"},
+    "write_exact_patch": {"edit_file", "diff_files", "read_file"},
+    "run_safe_commands": {
+        "run_command", "run_tests", "lint_code", "analyze_code", "git_diff", "read_file",
+        "amaura_register_content_asset", "create_document"
+    },
+    "run_sandboxed_experiment": {"run_command", "run_tests"},
+    "evaluate": {"read_file", "read_pdf", "web_search", "web_fetch", "run_command", "run_tests"},
+    "prioritise": {"read_file", "recall_memory", "amaura_company_status", "amaura_list_tasks"},
+    "recommend_pricing": {"read_file", "recall_memory", "amaura_company_status", "amaura_list_tasks"},
+    "create_draft_after_approval": {"read_file"},
+    "schedule_after_approval": {"read_file"},
+    "create_delivery_packet": {"read_file", "write_file", "create_document"},
+    "record_demo": {"read_file", "run_command", "amaura_register_content_asset"},
+    "render_audio": {"read_file", "run_command", "amaura_register_content_asset"},
 }
 
 
@@ -159,6 +203,26 @@ class PolicyEngine:
         return PolicyDecision(allowed=not reasons, reasons=tuple(reasons))
 
     @staticmethod
+    def validate_employee_permissions(agent_id: str) -> PolicyDecision:
+        agent = get_agent(agent_id)
+        task = {
+            "id": "contract_check",
+            "owner_id": agent_id,
+            "state": "in_progress",
+            "risk": agent.max_risk.value,
+            "budget_cents": 100,
+            "action_type": "internal",
+            "metadata": {"workspace": "."},
+        }
+        reasons: list[str] = []
+        for tool_name in agent.tools:
+            decision = PolicyEngine.validate_tool_action(task, agent_id, tool_name, {})
+            for reason in decision.reasons:
+                if "requires a matching agent permission scope" in reason or "outside" in reason:
+                    reasons.append(f"Tool '{tool_name}' failed permission check for employee '{agent_id}': {reason}")
+        return PolicyDecision(allowed=not reasons, reasons=tuple(reasons))
+
+    @staticmethod
     def validate_tool_action(task: dict[str, Any], agent_id: str, tool_name: str, args: dict[str, Any]) -> PolicyDecision:
         agent = get_agent(agent_id)
         reasons: list[str] = []
@@ -197,6 +261,8 @@ class PolicyEngine:
             candidate = candidate.resolve()
             if candidate != workspace and workspace not in candidate.parents:
                 reasons.append(f"Path argument '{key}' escapes the assigned workspace")
+            if any(pattern.search(str(candidate)) for pattern in FORBIDDEN_FILE_PATTERNS) or any(pattern.search(raw_value) for pattern in FORBIDDEN_FILE_PATTERNS):
+                reasons.append(f"Access to secret/credential file in argument '{key}' is strictly forbidden")
         if tool_name == "web_fetch":
             safe_url, url_reason = _public_http_url(str(args.get("url", "")))
             if not safe_url:

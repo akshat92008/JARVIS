@@ -1263,8 +1263,8 @@ class CompanyStore:
                 if message["status"] == "sent":
                     self._connection.rollback()
                     return self.get_message(message_id)
-                if message["status"] not in {"approved", "sending"}:
-                    raise ValueError("Only an approved or sending message can be marked sent")
+                if message["status"] not in {"approved", "sending", "queued", "dispatching"}:
+                    raise ValueError("Only an approved, sending, queued, or dispatching message can be marked sent")
                 comparator = "='followup'" if is_followup else "!='followup'"
                 count = self._connection.execute(
                     f"""SELECT COUNT(*) FROM messages m JOIN leads l ON l.id=m.lead_id

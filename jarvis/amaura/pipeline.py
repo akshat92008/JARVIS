@@ -103,6 +103,18 @@ def normalize_domain(value: str) -> str:
     return domain
 
 
+def _public_http_url(url: str) -> tuple[bool, str]:
+    if not url or not url.startswith(("http://", "https://")):
+        return False, "URL must start with http:// or https://"
+    try:
+        from jarvis.amaura.network import validate_public_url
+        validate_public_url(url, resolve=False)
+    except GovernanceError as exc:
+        return False, str(exc)
+    else:
+        return True, ""
+
+
 class AcquisitionPipeline:
     """Application service enforcing state, evidence, limits, approvals, and idempotency."""
 
@@ -143,8 +155,9 @@ class AcquisitionPipeline:
         duplicate = self.store.get_lead_by_domain(clean_domain)
         if duplicate:
             return {**duplicate, "duplicate": True}
-        if not source_url.startswith(("https://", "http://")):
-            raise GovernanceError("Lead discovery requires a public source URL")
+        safe_url, url_reason = _public_http_url(source_url)
+        if not safe_url:
+            raise GovernanceError(f"Lead discovery requires a valid public source URL: {url_reason}")
         try:
             lead = self.store.insert_lead({
                 "id": _id("lead"), "campaign_id": campaign_id, "company_name": company_name.strip(),
@@ -164,8 +177,9 @@ class AcquisitionPipeline:
     def add_evidence(self, lead_id: str, *, claim_type: str, claim: str, source_url: str,
                      source_excerpt: str, confidence: float, actor: str = "prospect_research") -> dict:
         lead = self.store.get_lead(lead_id)
-        if not source_url.startswith(("https://", "http://")) or not source_excerpt.strip():
-            raise GovernanceError("Evidence requires a public source URL and exact excerpt")
+        safe_url, url_reason = _public_http_url(source_url)
+        if not safe_url or not source_excerpt.strip():
+            raise GovernanceError(f"Evidence requires a valid public source URL and exact excerpt: {url_reason}")
         if not 0 <= confidence <= 1:
             raise GovernanceError("Evidence confidence must be between 0 and 1")
         scan = scan_untrusted_text(source_excerpt)
@@ -200,6 +214,9 @@ class AcquisitionPipeline:
         lead = self.store.get_lead(lead_id)
         campaign = self.store.get_campaign(lead["campaign_id"])
         total = sum(components.values())
+        evidence = self.store.list_lead_evidence(lead_id)
+        if total >= campaign["minimum_score"] and not evidence:
+            raise GovernanceError("A lead cannot be qualified without verified evidence")
         next_stage = LeadStage.QUALIFIED if total >= campaign["minimum_score"] else LeadStage.REJECTED
         current = LeadStage(lead["stage"])
         if current not in {LeadStage.RESEARCHED, LeadStage.RESEARCHING, LeadStage.DISCOVERED}:
@@ -232,6 +249,8 @@ class AcquisitionPipeline:
                       body: str, actor: str = "outreach_writer") -> dict:
         if not recipient.strip():
             raise GovernanceError("A recipient address is required to stage a message (P0-6)")
+        if channel == "email" and not re.fullmatch(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", recipient.strip()):
+            raise GovernanceError(f"Invalid email recipient address: {recipient}")
         lead = self.store.get_lead(lead_id)
         campaign = self.store.get_campaign(lead["campaign_id"])
         if lead["do_not_contact"] or LeadStage(lead["stage"]) in TERMINAL_STAGES:
@@ -316,8 +335,8 @@ class AcquisitionPipeline:
         message = self.store.get_message(message_id)
         if message["status"] == "sent":
             return message
-        if message["status"] != "approved":
-            raise GovernanceError("Only an approved message can be marked sent")
+        if message["status"] not in {"approved", "sending", "queued", "dispatching"}:
+            raise GovernanceError(f"Message status '{message['status']}' cannot be confirmed as sent")
         provider_name = "manual-break-glass"
         if provider_receipt is not None:
             raw_receipt = (

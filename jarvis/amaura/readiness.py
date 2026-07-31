@@ -155,11 +155,17 @@ def production_readiness(
         if agent.agent_id != "jarvis"
         and agent.reviewer_id not in {"founder", *{item.agent_id for item in ALL_AGENTS}}
     )
+    from jarvis.amaura.policy import PolicyEngine
+    invalid_permission_agents = [
+        agent.agent_id for agent in ALL_AGENTS
+        if not PolicyEngine.validate_employee_permissions(agent.agent_id).allowed
+    ]
     source_checks = {
         "database_integrity": bool(database["ok"]),
         "tamper_evident_audit_chain": bool(database["audit_chain"]["ok"]),
         "workforce_registry": len(ALL_AGENTS) >= 43 and not duplicate_agents,
         "workforce_tool_contract": not missing_tools,
+        "workforce_permission_contract": not invalid_permission_agents,
         "reviewer_contract": not invalid_reviewers,
         "workflow_catalogue": {
             "client_acquisition",
@@ -257,6 +263,7 @@ def production_readiness(
         name for name, passed in source_checks.items() if not passed
     ]
     return {
+        "ready": not blockers,
         "production_ready": not blockers,
         "source_certified": not source_blockers,
         "source_ready": not source_blockers,

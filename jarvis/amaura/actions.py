@@ -96,6 +96,14 @@ class AmauraActions:
         )
 
     def update_crm(self, lead_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        self.control.store.audit(
+            self.worker_id,
+            "update_crm",
+            "acquisition",
+            lead_id,
+            "allowed",
+            {"lead_id": lead_id, "fields": list(fields.keys())},
+        )
         from jarvis.amaura.n8n import get_n8n_client
         n8n = get_n8n_client()
         result = n8n.sync_crm(lead_id, fields)

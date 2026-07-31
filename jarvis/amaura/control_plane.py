@@ -533,6 +533,10 @@ class AmauraControlPlane:
             import subprocess
             wt_path = f"/tmp/amaura-worktrees/{task_id}"
             if os.path.exists(wt_path):
+                status_res = subprocess.run(["git", "status", "--porcelain"], cwd=wt_path, capture_output=True, text=True)
+                if status_res.stdout.strip():
+                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True)
+                    subprocess.run(["git", "commit", "-m", f"feat(amaura): completion task {task_id}"], cwd=wt_path, capture_output=True)
                 merge_result = subprocess.run(
                     ["git", "merge", "--no-ff", f"amaura-{task_id}", "-m", f"Merge task {task_id}"],
                     cwd=task["metadata"]["workspace"],
@@ -545,7 +549,7 @@ class AmauraControlPlane:
                         + merge_result.stderr.decode(errors="replace")
                     )
                 subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
-                subprocess.run(["git", "branch", "-d", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
+                subprocess.run(["git", "branch", "-D", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
                 
         task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
         event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"
