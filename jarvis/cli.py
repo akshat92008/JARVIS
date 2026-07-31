@@ -11,15 +11,14 @@ Usage:
     jarvis --list-models            Show all available models
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
 
-from jarvis.agent import JarvisAgent
 from jarvis.models import resolve_model, DEFAULT_MODEL, list_models
 from jarvis import ui
-from jarvis.memory import ConversationMemory
-from jarvis.voice.engine import VoiceEngine
 
 
 def parse_args():
@@ -131,6 +130,8 @@ def handle_slash_command(cmd: str, agent: JarvisAgent, voice_engine: VoiceEngine
         return True
 
     elif command == "/history":
+        from jarvis.memory import ConversationMemory
+
         mem = ConversationMemory()
         convs = mem.list_conversations(limit=10)
         if not convs:
@@ -410,6 +411,14 @@ def main():
     """Main entry point."""
     args = parse_args()
 
+    # Amaura has its own fail-closed operator CLI. Route before resolving or
+    # instantiating the general JARVIS assistant so workforce operation never
+    # depends on an NVIDIA key or interactive-agent startup.
+    if args.amaura:
+        from jarvis.amaura.cli import main as amaura_main
+
+        return amaura_main(["worker"])
+
     # List models
     if args.list_models:
         models = list_models()
@@ -430,7 +439,9 @@ def main():
     # Print boot banner IMMEDIATELY for instant terminal feedback
     ui.print_boot_sequence(model_cfg["name"], working_dir)
 
-    # Create agent
+    # Create the general assistant only after Amaura and listing routes exit.
+    from jarvis.agent import JarvisAgent
+
     try:
         agent = JarvisAgent(
             api_key=args.api_key,
@@ -442,6 +453,8 @@ def main():
         sys.exit(1)
 
     # Voice engine
+    from jarvis.voice.engine import VoiceEngine
+
     voice_engine = VoiceEngine()
     if args.voice:
         if voice_engine.available:
@@ -457,16 +470,6 @@ def main():
         ui.print_success(f"JARVIS Web Interface running at {url}")
         from jarvis.server import main as start_server
         start_server()
-        return
-
-    # Amaura daemon mode
-    if args.amaura:
-        ui.print_info("Initializing Amaura daemon environment...")
-        try:
-            from jarvis.amaura.daemon import start_daemon
-            start_daemon()
-        except Exception as e:
-            ui.print_error(f"Failed to start Amaura daemon: {e}")
         return
 
     # Telegram mode

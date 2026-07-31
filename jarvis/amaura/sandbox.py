@@ -39,7 +39,7 @@ class DockerSandbox:
         self.docker_binary = docker_binary or shutil.which("docker")
         self.image = image or os.environ.get(
             "AMAURA_SANDBOX_IMAGE",
-            "amaura-sandbox:1.1.0",
+            "amaura-sandbox:1.2.0",
         )
 
     @property
@@ -141,7 +141,7 @@ class StatefulDockerSandbox:
         self.docker_binary = docker_binary or shutil.which("docker")
         self.image = image or os.environ.get(
             "AMAURA_SANDBOX_IMAGE",
-            "amaura-sandbox:1.1.0",
+            "amaura-sandbox:1.2.0",
         )
         self.workspace = Path(workspace).expanduser().resolve()
         if not self.workspace.is_dir():

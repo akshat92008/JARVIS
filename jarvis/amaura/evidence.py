@@ -158,6 +158,114 @@ class EvidenceVault:
         }
 
 
+def strict_evidence_enabled(task: dict[str, Any]) -> bool:
+    metadata = dict(task.get("metadata") or {})
+    return metadata.get("strict_evidence") is True or os.environ.get("AMAURA_STRICT_EVIDENCE", "0") == "1"
+
+
+def strict_review_enabled(task: dict[str, Any]) -> bool:
+    metadata = dict(task.get("metadata") or {})
+    return metadata.get("strict_review") is True or os.environ.get("AMAURA_STRICT_REVIEW", "0") == "1"
+
+
+def validate_criterion_review(
+    task: dict[str, Any],
+    decision: dict[str, Any],
+    vault: EvidenceVault,
+) -> dict[str, Any]:
+    """Validate reviewer criterion coverage against the immutable task evidence set."""
+    criteria = [str(item) for item in (task.get("acceptance_criteria") or [])]
+    raw_results = decision.get("criteria")
+    findings: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    successful_refs = {
+        str(item.get("reference", ""))
+        for item in (task.get("evidence") or [])
+        if item.get("success") is not False and str(item.get("reference", ""))
+    }
+    strict = strict_review_enabled(task)
+    if not isinstance(raw_results, list):
+        raw_results = []
+    if strict and criteria and len(raw_results) != len(criteria):
+        findings.append(
+            f"Reviewer covered {len(raw_results)} of {len(criteria)} acceptance criteria"
+        )
+
+    covered: set[int] = set()
+    for position, raw in enumerate(raw_results, start=1):
+        if not isinstance(raw, dict):
+            findings.append(f"Criterion review {position} is not an object")
+            continue
+        raw_index = raw.get("criterion_index")
+        index: int | None = None
+        if isinstance(raw_index, int):
+            candidate = raw_index - 1 if raw_index >= 1 else raw_index
+            if 0 <= candidate < len(criteria):
+                index = candidate
+        if index is None:
+            criterion_text = str(raw.get("criterion", "")).strip()
+            matches = [i for i, criterion in enumerate(criteria) if criterion == criterion_text]
+            if len(matches) == 1:
+                index = matches[0]
+        if index is None:
+            findings.append(f"Criterion review {position} does not identify a real acceptance criterion")
+            continue
+        if index in covered:
+            findings.append(f"Acceptance criterion {index + 1} is reviewed more than once")
+            continue
+        covered.add(index)
+        passed = raw.get("passed")
+        if not isinstance(passed, bool):
+            findings.append(f"Acceptance criterion {index + 1} has no boolean passed result")
+            passed = False
+        refs = raw.get("evidence_refs", raw.get("evidence", []))
+        if isinstance(refs, str):
+            refs = [refs]
+        if not isinstance(refs, list):
+            refs = []
+        refs = [str(ref).strip() for ref in refs if str(ref).strip()]
+        invalid_refs = [ref for ref in refs if ref not in successful_refs]
+        if invalid_refs:
+            findings.append(
+                f"Acceptance criterion {index + 1} cites evidence outside the approved submission"
+            )
+        if strict and not refs:
+            findings.append(f"Acceptance criterion {index + 1} has no evidence reference")
+        if strict:
+            for ref in refs:
+                verification = vault.verify(ref)
+                if not verification["ok"]:
+                    findings.append(
+                        f"Acceptance criterion {index + 1} cites unverifiable evidence: {verification['reason']}"
+                    )
+        normalized.append(
+            {
+                "criterion_index": index + 1,
+                "criterion": criteria[index],
+                "passed": bool(passed),
+                "evidence_refs": refs,
+                "notes": str(raw.get("notes", "")).strip(),
+            }
+        )
+
+    if strict:
+        missing = [index + 1 for index in range(len(criteria)) if index not in covered]
+        if missing:
+            findings.append(f"Acceptance criteria missing reviewer coverage: {missing}")
+        if decision.get("approve") is True:
+            failed = [item["criterion_index"] for item in normalized if not item["passed"]]
+            if failed:
+                findings.append(f"Reviewer approved while criteria failed: {failed}")
+    return {
+        "ok": not findings,
+        "strict": strict,
+        "findings": findings,
+        "criteria": normalized,
+        "criteria_count": len(criteria),
+        "covered_count": len(covered),
+    }
+
+
 def deterministic_evidence_review(
     task: dict[str, Any],
     vault: EvidenceVault,
@@ -167,6 +275,7 @@ def deterministic_evidence_review(
     evidence = task.get("evidence") or []
     findings: list[str] = []
     verified: list[dict[str, Any]] = []
+    strict = strict_evidence_enabled(task)
     if not str(task.get("summary", "")).strip():
         findings.append("Submission has no completion summary")
     if not evidence:
@@ -186,9 +295,9 @@ def deterministic_evidence_review(
                     f"Evidence {index + 1} failed integrity verification: "
                     f"{result['reason']}"
                 )
-        elif item.get("type") == "tool_result":
+        elif strict or item.get("type") == "tool_result":
             findings.append(
-                f"Tool evidence {index + 1} is not stored in the evidence vault"
+                f"Evidence {index + 1} is not stored in the content-addressed evidence vault"
             )
     criteria = task.get("acceptance_criteria") or []
     if criteria and not evidence:
@@ -199,6 +308,7 @@ def deterministic_evidence_review(
         "verified_evidence": verified,
         "criteria_count": len(criteria),
         "evidence_count": len(evidence),
+        "strict": strict,
         "submission_sha256": hashlib.sha256(
             _canonical_bytes(
                 {
@@ -275,5 +385,8 @@ __all__ = [
     "EvidenceVault",
     "create_review_attestation",
     "deterministic_evidence_review",
+    "strict_evidence_enabled",
+    "strict_review_enabled",
+    "validate_criterion_review",
     "verify_review_attestation",
 ]

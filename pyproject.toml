@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jarvis"
-version = "1.1.0"
+version = "1.2.0"
 description = "J.A.R.V.I.S. — Just A Rather Very Intelligent System. Personal AI assistant powered by NVIDIA."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,6 +48,7 @@ dev = [
 jarvis = "jarvis.cli:main"
 nexus = "jarvis.cli:main"
 amaura-worker = "jarvis.amaura.supervisor:main"
+amaura = "jarvis.amaura.cli:main"
 
 
 [tool.setuptools.packages.find]

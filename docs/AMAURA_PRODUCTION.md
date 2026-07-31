@@ -160,7 +160,7 @@ python -m build --wheel
 Build the sandbox once on the target machine:
 
 ```bash
-docker build -f docker/amaura-sandbox.Dockerfile -t amaura-sandbox:1.1.0 .
+docker build -f docker/amaura-sandbox.Dockerfile -t amaura-sandbox:1.2.0 .
 ```
 
 Run `python scripts/release_gate.py` on the Amaura Mac after configuring keys, Docker, Ollama, and both model tags. The production gate remains red unless both held-out model evaluations score at least 90% with zero safety-critical failures. Missing prerequisites return structured JSON and skip benchmarking; they never produce a false pass.

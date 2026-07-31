@@ -1,0 +1,30 @@
+{
+  "release_name": "Amaura Labs Internal Launch Candidate",
+  "verified_at": "2026-07-31",
+  "scope": "private founder-controlled local operation",
+  "automated_tests": {
+    "passed": 144,
+    "failed": 0,
+    "mode": "hermetic with mocked provider/model calls"
+  },
+  "verified_gates": {
+    "python_compile": true,
+    "static_source_certification": true,
+    "repository_secret_scan": true,
+    "sqlite_backup_restore": true,
+    "strict_git_delivery_regressions": true,
+    "provider_outbox_reconciliation_regressions": true
+  },
+  "live_certification": {
+    "verified_in_build_container": false,
+    "reason": "Docker, Ollama, and local worker/reviewer models are machine-specific and unavailable in the build container.",
+    "required_command": ".venv/bin/amaura doctor",
+    "required_result": {"production_ready": true}
+  },
+  "artifact_safety": {
+    "generated_secrets_included": false,
+    "runtime_databases_included": false,
+    "runtime_evidence_included": false,
+    "temporary_openai_test_stub_included": false
+  }
+}

@@ -26,12 +26,15 @@ from pydantic import BaseModel
 
 from jarvis.agent import JarvisAgent
 from jarvis.amaura import commands as cmd
+from jarvis.amaura.runtime import load_amaura_env
 from jarvis.memory import ConversationMemory
 from jarvis.models import DEFAULT_MODEL, list_models
 from jarvis.tools.registry import ALL_TOOL_DEFINITIONS, execute_tool, get_tool_count
 from jarvis.user_memory import UserMemory
 from jarvis.voice.engine import VoiceEngine
 from jarvis.voice.speaker import Speaker, get_speaker
+
+load_amaura_env()
 
 # ── App Setup ──────────────────────────────────────────────────────────────────
 
@@ -219,6 +222,11 @@ class AmauraDeliverMessageRequest(BaseModel):
 class AmauraKillSwitchRequest(BaseModel):
     enabled: bool
     reason: str
+
+class AmauraOutboxReconciliationRequest(BaseModel):
+    resolution: str
+    reason: str
+    provider_receipt: dict = {}
 
 class AmauraContentCampaignRequest(BaseModel):
     campaign_id: str
@@ -851,6 +859,46 @@ async def amaura_pipeline_kill_switch(req: AmauraKillSwitchRequest,
     return control.acquisition.set_kill_switch(req.enabled, actor=control.founder_id, reason=req.reason)
 
 
+@app.get("/api/amaura/outbox")
+async def amaura_list_outbox_events(
+    status: str = "",
+    limit: int = 100,
+    operator_key: str = Header(default="", alias="X-Amaura-Operator-Key"),
+):
+    """List durable provider operations, including quarantined ambiguous sends."""
+    _require_amaura_key("AMAURA_OPERATOR_KEY", operator_key, "operator")
+    try:
+        return {
+            "events": _amaura_control().store.list_outbox_events(
+                status=status.strip() or None,
+                limit=limit,
+            )
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/amaura/outbox/{event_id}/reconcile")
+async def amaura_reconcile_outbox_event(
+    event_id: str,
+    req: AmauraOutboxReconciliationRequest,
+    approval_key: str = Header(default="", alias="X-Amaura-Approval-Key"),
+):
+    """Resolve an uncertain provider attempt through founder authority."""
+    _require_amaura_key("AMAURA_APPROVAL_KEY", approval_key, "founder approval")
+    control = _amaura_control()
+    try:
+        return control.reconcile_outbox_event(
+            event_id,
+            resolution=req.resolution,
+            reason=req.reason,
+            provider_receipt=req.provider_receipt or None,
+            actor=control.founder_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # -- Content factory -----------------------------------------------------------
 
 @app.post("/api/amaura/content/campaigns")
@@ -1158,7 +1206,7 @@ def main():
         "jarvis.server:app",
         host=host,
         port=port,
-        reload=True,
+        reload=os.environ.get("JARVIS_RELOAD", "0") == "1",
         log_level="info",
     )
 

@@ -1,78 +1,63 @@
-# Amaura Production Verification Report
+# Amaura Launch-Candidate Verification Report
 
-Date: 2026-07-29
+Date: 2026-07-31
 
 ## Verdict
 
-The Amaura source release passes its complete hermetic engineering gate. The
-system is ready for deployment configuration and live certification on the
-Amaura host; it does not claim operational readiness until the required local
-models, Docker sandbox, authority keys, founder identity, and provider
-credentials pass `python scripts/release_gate.py`.
+The Amaura source tree passes its complete hermetic regression suite and static release-certification gate. It is a **local launch candidate**, not an unconditional claim of operational perfection. The actual Mac must still pass live Docker, Ollama, distinct-model, configuration, and model-quality checks through `amaura doctor`.
 
-External actions remain fail-closed. Gmail delivery and private publication
-must return authenticated, idempotent provider receipts, while public
-publication, pricing, proposals, outreach, and deployment remain
-founder-approved actions.
+External email and public publishing remain disabled by default. Founder approval, criterion-bound evidence, signed review attestations, exact Git snapshots, and provider receipts fail closed.
 
-## Verified results
+## Verified in the build environment
 
 | Gate | Result |
 | --- | --- |
-| Complete repository test suite | 85 passed; 0 failed |
-| Production-critical suite | 22 passed; 0 failed |
-| Ruff analysis | Passed |
-| Mypy analysis | Passed: 18 core modules, 0 issues |
-| Static production gate | Passed; no source blockers |
+| Complete repository test suite | **144 passed; 0 failed** |
+| Launch-critical strict-control subset | **48 passed; 0 failed** |
+| Python compile check | Passed |
+| Static release certification | Passed; no source blockers |
 | Repository credential scan | Passed; no findings |
-| Wheel build | Passed: `jarvis-1.1.0-py3-none-any.whl` |
-| Workforce contract | 43 employees; no missing tools or invalid reviewers |
-| SQLite integrity | `ok`; 0 foreign-key violations; WAL enabled |
+| SQLite backup restoration | Passed; integrity `ok`, 0 foreign-key violations |
+| Workforce contract | 43+ employees; no missing tools or invalid reviewers |
+| Strict Git regression | Exact commit merge, drift rejection, rollback passed |
+| Outbox regression | Leases, ownership, ambiguous-send reconciliation passed |
 
-The two full-suite warnings are Python 3.12 deprecation warnings emitted by
-SpeechRecognition dependencies; neither is a test or Amaura-kernel failure.
+## Environment limitation
 
-## Extreme stress and adversarial run
+The restricted build container could not download the declared `openai`, build, Ruff, or mypy packages from its internal package mirror. The test suite was therefore collected with a temporary **out-of-repository OpenAI import stub**; model calls remained mocked as designed by the hermetic tests. No stub is included in the release archive.
 
-`python scripts/stress_amaura.py` completed successfully:
+A wheel build, Ruff run, mypy run, live Docker build, and live Ollama evaluation must be executed by `Install_Amaura.command`, `scripts/verify_amaura.sh`, and `amaura doctor` on the target Mac with normal package access.
 
-| Scenario | Result |
-| --- | ---: |
-| Concurrent workers | 32 |
-| Evidence-backed leads ingested | 1,000 |
-| Prompt-injection payloads detected | 100 / 100 |
-| Provider-confirmed outbound actions | 60 |
-| Sends blocked by daily caps | 20 / 20 |
-| Simultaneous duplicate attempts | 500 |
-| Records created from duplicate race | 1 |
-| End-of-run database integrity | Passed |
+## Controls exercised
 
-## Production controls exercised
-
-- Atomic task leases, heartbeats, bounded retries, and crash recovery.
-- Independent reviewer assignment and distinct worker/reviewer model contract.
-- Deterministic evidence verification and HMAC-signed review attestations.
-- Content-addressed evidence with tamper detection.
-- Exact-payload founder approvals with 48-hour expiry.
+- Durable task leases, heartbeats, bounded retries, and crash recovery.
+- Worker-owned provider outbox leases with retry and reconciliation states.
+- Ambiguous email attempts quarantined instead of automatically replayed.
+- Independent reviewer assignment and distinct-model routing contract.
+- Content-addressed evidence and exact acceptance-criterion coverage.
+- Signed review attestations bound to the current submission hash.
+- Founder approval bound to the exact summary, evidence, cost, and Git snapshot.
+- Isolated Git worktrees, repository merge locks, head-drift checks, post-merge validation, and compensating rollback.
+- Atomic founder decision and durable task-completion transitions.
 - Docker-isolated, network-disabled command execution that fails closed.
-- DNS-aware SSRF, redirect, metadata-network, and credential-leak protection.
-- Authenticated Gmail and private-publication receipts with idempotency.
-- Durable metrics, traces, alerts, and Prometheus rendering.
-- Atomic lead limits, deduplication, opt-outs, follow-up caps, and kill switch.
-- Complete runtime dependency metadata and Python 3.11/3.12 GitHub CI.
-- Credential-free, network-hermetic automated tests.
+- Prompt-injection quarantine, SSRF controls, path controls, credential redaction, and repository secret scanning.
+- Transactionally consistent SQLite backups with restoration verification.
+- Experimental LangGraph orchestration disabled by default.
 
-## Live certification requirements
+## Live certification
 
-The static gate deliberately reports live configuration as incomplete in this
-container. Before unattended operation, configure independent authority and
-receipt keys, bind Telegram to the founder identity, install/build the governed
-Docker sandbox, and provide two distinct Ollama models. Then run:
+After local installation, run:
 
 ```bash
-python scripts/release_gate.py
+.venv/bin/amaura doctor
 ```
 
-The live gate requires both held-out model evaluations to score at least 90%
-with zero safety-critical failures. Provider credentials and OAuth grants must
-be supplied only through environment or secret-management configuration.
+Continuous operation is allowed only when the output reports:
+
+```json
+{
+  "production_ready": true
+}
+```
+
+The live gate requires Docker health, both distinct Ollama models, successful held-out evaluations, independent keys, strict evidence/review/Git modes, a writable backup destination, and valid configuration for every explicitly enabled external provider. Telegram founder binding is required only when the Telegram bot token is configured.

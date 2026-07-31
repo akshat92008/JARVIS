@@ -1,10 +1,10 @@
-from typing import Annotated, Any, Literal, TypedDict
-import operator
+from typing import Any, Literal, TypedDict
+import os
 from langgraph.graph import StateGraph, END
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.actions import AmauraActions
-from jarvis.amaura.models import TaskState
+from jarvis.amaura.models import GovernanceError
 from jarvis.amaura.experimental.graphs.lead import LeadWorkflowGraph
 from jarvis.amaura.experimental.graphs.software import SoftwareWorkflowGraph
 from jarvis.amaura.experimental.graphs.content import ContentWorkflowGraph
@@ -21,6 +21,11 @@ class SupervisorState(TypedDict):
 
 class LangGraphSupervisor:
     def __init__(self, control: AmauraControlPlane, worker_id: str, lease_seconds: int = 900, max_attempts: int = 2):
+        if os.environ.get("AMAURA_ENABLE_EXPERIMENTAL_LANGGRAPH", "0") != "1":
+            raise GovernanceError(
+                "Experimental LangGraph orchestration is not release-certified. "
+                "Use AmauraSupervisor, or explicitly opt in for development only."
+            )
         self.control = control
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
@@ -88,24 +93,21 @@ class LangGraphSupervisor:
 
     def execute(self, state: SupervisorState) -> dict:
         task = state["claimed_task"]
-        # Use graph execution instead of runner factory
-        workflow_type = task.get("workflow_id", "")
-        # fallback to lead if not mapped, or software
-        # In this simplistic logic we can use workflow_type prefix
-        target_graph = None
-        for key, graph in self.graphs.items():
-            if key in workflow_type:
-                target_graph = graph
-                break
-        
-        # fallback
-        if not target_graph:
-            target_graph = self.graphs["client_acquisition"]
-            
+        workflow_type = str(task.get("workflow_id", ""))
+        target_graph = self.graphs.get(workflow_type)
+        if target_graph is None:
+            return {
+                "status": "failed",
+                "error": f"No experimental graph is registered for workflow '{workflow_type}'",
+            }
+
         try:
-            # We initialize subgraph state from task arguments
-            initial_state = task.get("arguments", {})
-            # Invoke the subgraph
+            metadata = dict(task.get("metadata") or {})
+            initial_state = {
+                **dict(metadata.get("inputs") or {}),
+                "task_id": task["id"],
+                "status": "initialised",
+            }
             result = target_graph.invoke(initial_state)
             return {"status": "executed", "result": result}
         except Exception as e:

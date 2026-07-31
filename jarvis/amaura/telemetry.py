@@ -119,7 +119,7 @@ class OperationalTelemetry:
         lines = [
             "# HELP amaura_build_info Amaura internal workforce build information.",
             "# TYPE amaura_build_info gauge",
-            'amaura_build_info{version="1.1.0"} 1',
+            'amaura_build_info{version="1.2.0"} 1',
         ]
         for metric in self.store.list_metrics():
             name = metric["name"]

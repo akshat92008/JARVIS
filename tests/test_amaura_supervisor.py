@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jarvis.amaura.control_plane import AmauraControlPlane
+from jarvis.amaura.evidence import deterministic_evidence_review
 from jarvis.amaura.executor import GovernedTaskRunner
 from jarvis.amaura.models import GovernanceError, TaskState
 from jarvis.amaura.policy import PolicyEngine
@@ -41,12 +42,19 @@ class _SuccessfulReviewer:
 
     def run(self, task_id: str) -> dict:
         task = self.control.store.get_work_item(task_id)
+        deterministic = deterministic_evidence_review(task, self.control.evidence)
         updated = self.control.review_task(
             task_id,
             actor=task["reviewer_id"],
             approve=True,
             findings="Every acceptance criterion is supported by the submitted report.",
-            attestation={"signature": "mock", "decision": {"approve": True}, "task_id": task_id, "reviewer_id": task["reviewer_id"]}
+            attestation={
+                "signature": "mock",
+                "decision": {"approve": True, "criteria": []},
+                "deterministic_review": deterministic,
+                "task_id": task_id,
+                "reviewer_id": task["reviewer_id"],
+            },
         )
         return {"task_id": task_id, "approve": True, "state": updated["state"]}
 
@@ -78,6 +86,16 @@ class TestAmauraSupervisor(unittest.TestCase):
             workflow_key="software_delivery",
             inputs={"repository_path": self.temp_dir.name},
         )
+
+    def _attestation(self, task_id: str, reviewer_id: str) -> dict:
+        task = self.control.store.get_work_item(task_id)
+        return {
+            "signature": "mock",
+            "decision": {"approve": True, "criteria": []},
+            "deterministic_review": deterministic_evidence_review(task, self.control.evidence),
+            "task_id": task_id,
+            "reviewer_id": reviewer_id,
+        }
 
     def test_supervisor_leases_executes_and_reviews_independently(self):
         programme = self._programme()
@@ -177,7 +195,7 @@ class TestAmauraSupervisor(unittest.TestCase):
                 task["reviewer_id"],
                 True,
                 "Evidence sources verified.",
-                attestation={"signature": "mock", "decision": {"approve": True}, "task_id": task["id"], "reviewer_id": task["reviewer_id"]}
+                attestation=self._attestation(task["id"], task["reviewer_id"]),
             )
         self.control.start_task(content_task["id"])
         self.control.submit_task(
@@ -191,7 +209,7 @@ class TestAmauraSupervisor(unittest.TestCase):
             content_task["reviewer_id"],
             True,
             "Claims verified.",
-            attestation={"signature": "mock", "decision": {"approve": True}, "task_id": content_task["id"], "reviewer_id": content_task["reviewer_id"]}
+            attestation=self._attestation(content_task["id"], content_task["reviewer_id"]),
         )
         approval = self.control.store.list_approvals("pending")[0]
         self.control.store.update_work_item(

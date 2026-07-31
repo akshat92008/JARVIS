@@ -52,3 +52,6 @@ yarn-error.log*
 *.sqlite
 *.db
 .jarvis-data/
+.amaura-data/
+.env.amaura
+amaura-launch-report.json

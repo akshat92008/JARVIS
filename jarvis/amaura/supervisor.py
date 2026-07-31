@@ -30,6 +30,8 @@ class AmauraSupervisor:
         worker_id: str | None = None,
         lease_seconds: int = 900,
         max_attempts: int = 2,
+        outbox_max_attempts: int | None = None,
+        outbox_lease_seconds: int | None = None,
         runner_factory: RunnerFactory = GovernedTaskRunner,
         reviewer_factory: ReviewerFactory = GovernedReviewRunner,
         automatic_reviews: bool = True,
@@ -40,6 +42,14 @@ class AmauraSupervisor:
         )
         self.lease_seconds = max(30, min(int(lease_seconds), 86_400))
         self.max_attempts = max(1, min(int(max_attempts), 20))
+        self.outbox_max_attempts = max(
+            1,
+            min(int(outbox_max_attempts or self.max_attempts), 20),
+        )
+        self.outbox_lease_seconds = max(
+            30,
+            min(int(outbox_lease_seconds or min(self.lease_seconds, 300)), 3600),
+        )
         self.runner_factory = runner_factory
         self.reviewer_factory = reviewer_factory
         self.automatic_reviews = automatic_reviews
@@ -49,6 +59,8 @@ class AmauraSupervisor:
             "worker_id": self.worker_id,
             "lease_seconds": self.lease_seconds,
             "max_attempts": self.max_attempts,
+            "outbox_max_attempts": self.outbox_max_attempts,
+            "outbox_lease_seconds": self.outbox_lease_seconds,
             "automatic_reviews": self.automatic_reviews,
             "executions": self.control.store.execution_status(),
             "ready_tasks": len(self.control.list_tasks(TaskState.ASSIGNED.value)),
@@ -71,14 +83,36 @@ class AmauraSupervisor:
             return self._tick(workflow_id=workflow_id)
 
     def _tick(self, *, workflow_id: str | None = None) -> dict[str, Any]:
-        # Process pending outbox events first
-        outbox_events = self.control.store.fetch_pending_outbox_events(limit=10)
+        # Process durable provider operations before task work. Every event is leased;
+        # ambiguous email attempts are never blindly replayed.
+        recovered_outbox = self.control.store.recover_expired_outbox_events()
+        for event in recovered_outbox:
+            if event["status"] == "reconciliation_required" and event["operation"] == "send_email":
+                message_id = str(event.get("payload", {}).get("message_id", ""))
+                if message_id:
+                    self.control.store.mark_message_reconciliation_required(
+                        message_id,
+                        "Outbox worker lease expired during provider delivery",
+                    )
+                self.control.telemetry.alert(
+                    severity="critical",
+                    code="outbox_reconciliation_required",
+                    message="An email provider attempt became ambiguous and requires reconciliation.",
+                    resource_id=event["id"],
+                    details={"provider": event["provider"], "operation": event["operation"]},
+                )
+
+        outbox_events = self.control.store.fetch_pending_outbox_events(
+            limit=10,
+            worker_id=self.worker_id,
+            lease_seconds=self.outbox_lease_seconds,
+            max_attempts=self.outbox_max_attempts,
+        )
         dispatched_events = []
         for event in outbox_events:
             try:
                 receipt = dispatch_outbox_event(event)
-                
-                # If this was an email, we need to confirm the pipeline message
+
                 if event["operation"] == "send_email":
                     payload = event["payload"]
                     self.control.acquisition.confirm_external_send(
@@ -86,18 +120,61 @@ class AmauraSupervisor:
                         actor=payload.get("actor", "jarvis"),
                         provider_receipt=receipt,
                     )
-                    
-                self.control.store.complete_outbox_event(event["id"])
-                dispatched_events.append({"id": event["id"], "status": "success", "receipt": receipt})
+
+                receipt_dict = receipt.to_dict()
+                completed = self.control.store.complete_outbox_event(
+                    event["id"],
+                    worker_id=self.worker_id,
+                    receipt=receipt_dict,
+                    max_attempts=self.outbox_max_attempts,
+                )
+                self.control.store.publish_event(
+                    "outbox.completed",
+                    event["id"],
+                    {"provider": event["provider"], "operation": event["operation"]},
+                )
+                dispatched_events.append(
+                    {"id": event["id"], "status": completed["status"], "receipt": receipt_dict}
+                )
             except Exception as exc:
-                self.control.store.complete_outbox_event(event["id"], error=str(exc))
-                dispatched_events.append({"id": event["id"], "status": "failed", "error": str(exc)})
+                retryable = self._outbox_retryable(event, exc)
+                completed = self.control.store.complete_outbox_event(
+                    event["id"],
+                    error=str(exc),
+                    worker_id=self.worker_id,
+                    retryable=retryable,
+                    reconciliation_required=(
+                        event["operation"] == "send_email" and not retryable
+                    ),
+                    max_attempts=self.outbox_max_attempts,
+                )
+                if event["operation"] == "send_email" and completed["status"] in {
+                    "failed",
+                    "reconciliation_required",
+                }:
+                    message_id = str(event.get("payload", {}).get("message_id", ""))
+                    if message_id:
+                        self.control.store.mark_message_reconciliation_required(message_id, str(exc))
+                dispatched_events.append(
+                    {"id": event["id"], "status": completed["status"], "error": str(exc)}
+                )
                 self.control.telemetry.alert(
-                    severity="warning",
+                    severity=(
+                        "critical"
+                        if completed["status"] in {"failed", "reconciliation_required"}
+                        else "warning"
+                    ),
                     code="outbox_dispatch_failed",
                     message="Failed to dispatch outbox event.",
                     resource_id=event["id"],
-                    details={"provider": event["provider"], "operation": event["operation"], "error": str(exc)}
+                    details={
+                        "provider": event["provider"],
+                        "operation": event["operation"],
+                        "error": str(exc),
+                        "retryable": retryable,
+                        "status": completed["status"],
+                        "attempt": completed.get("attempt", 0),
+                    },
                 )
 
         recovered = self.control.store.recover_expired_executions(
@@ -328,6 +405,18 @@ class AmauraSupervisor:
                 return
 
     @staticmethod
+    def _outbox_retryable(event: dict[str, Any], exc: Exception) -> bool:
+        """Retry only operations with a safe provider-side idempotency story."""
+        if event.get("operation") == "send_email":
+            # A timeout may occur after Gmail accepted the message. Replaying would
+            # risk duplicate outreach, so ambiguous email errors require reconciliation.
+            return False
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return True
+        message = str(exc).lower()
+        return any(marker in message for marker in ("temporarily unavailable", "rate limit", "timeout", "timed out"))
+
+    @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return True
@@ -373,6 +462,8 @@ def main() -> int:
         control,
         lease_seconds=int(os.environ.get("AMAURA_LEASE_SECONDS", "900")),
         max_attempts=int(os.environ.get("AMAURA_MAX_ATTEMPTS", "2")),
+        outbox_max_attempts=int(os.environ.get("AMAURA_OUTBOX_MAX_ATTEMPTS", "3")),
+        outbox_lease_seconds=int(os.environ.get("AMAURA_OUTBOX_LEASE_SECONDS", "120")),
         automatic_reviews=not args.no_auto_review,
     )
     try:

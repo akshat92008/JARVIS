@@ -40,6 +40,7 @@ class CompanyStore:
         "result",
         "labels",
         "attributes",
+        "receipt",
     }
     MUTABLE_WORK_FIELDS: ClassVar[set[str]] = {
         "owner_id",
@@ -487,10 +488,15 @@ class CompanyStore:
                 payload TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+                worker_id TEXT NOT NULL DEFAULT '',
+                lease_until TEXT,
+                next_attempt_at TEXT,
+                receipt TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
+                updated_at TEXT,
                 processed_at TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, created_at);
         """
         with self._lock:
             self._connection.executescript(schema)
@@ -501,6 +507,16 @@ class CompanyStore:
             # P0-6: bind recipient and payload hash to message at staging time
             self._ensure_column("messages", "recipient", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("messages", "approved_payload_hash", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("outbox_events", "attempt", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("outbox_events", "worker_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("outbox_events", "lease_until", "TEXT")
+            self._ensure_column("outbox_events", "next_attempt_at", "TEXT")
+            
+            # Create indexes after ensuring columns exist
+            self._connection.execute("CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, next_attempt_at, created_at)")
+            self._connection.execute("CREATE INDEX IF NOT EXISTS idx_outbox_lease ON outbox_events(status, lease_until)")
+            self._ensure_column("outbox_events", "receipt", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("outbox_events", "updated_at", "TEXT")
             self._backfill_approval_integrity()
             self._backfill_audit_hash_chain()
             self._commit_if_needed()
@@ -822,60 +838,273 @@ class CompanyStore:
         return {"sequence": cursor.lastrowid, "event_type": event_type, "aggregate_id": aggregate_id, "payload": payload, "created_at": created_at}
 
     def enqueue_outbox_event(self, provider: str, operation: str, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
-        """Enqueue an event for out-of-band delivery via the provider matrix."""
+        """Enqueue one idempotent provider operation for durable dispatch."""
         now = utc_now()
         event_id = f"outbox_{uuid.uuid4().hex[:16]}"
         with self._lock:
             try:
                 self._connection.execute(
-                    "INSERT INTO outbox_events(id, idempotency_key, provider, operation, payload, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-                    (event_id, idempotency_key, provider, operation, json.dumps(payload), now),
+                    """INSERT INTO outbox_events(
+                    id,idempotency_key,provider,operation,payload,status,error,attempt,
+                    worker_id,lease_until,next_attempt_at,receipt,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'pending','',0,'',NULL,?, '{}',?,?)""",
+                    (
+                        event_id,
+                        idempotency_key,
+                        provider,
+                        operation,
+                        json.dumps(payload),
+                        now,
+                        now,
+                        now,
+                    ),
                 )
                 self._commit_if_needed()
             except sqlite3.IntegrityError:
-                # If the idempotency key already exists, return the existing event
-                row = self._connection.execute("SELECT * FROM outbox_events WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+                row = self._connection.execute(
+                    "SELECT * FROM outbox_events WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
                 if row:
-                    return self._decode_row(row) # type: ignore
+                    return self._decode_row(row)  # type: ignore[return-value]
                 raise
         return self.get_outbox_event(event_id)
 
     def get_outbox_event(self, event_id: str) -> dict[str, Any]:
         with self._lock:
-            row = self._connection.execute("SELECT * FROM outbox_events WHERE id = ?", (event_id,)).fetchone()
+            row = self._connection.execute(
+                "SELECT * FROM outbox_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
         decoded = self._decode_row(row)
         if decoded is None:
             raise KeyError(f"Unknown outbox event: {event_id}")
         return decoded
 
-    def fetch_pending_outbox_events(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Fetch pending outbox events. Mark them as 'processing' so they are not fetched concurrently."""
-        with self._lock:
+    def recover_expired_outbox_events(self) -> list[dict[str, Any]]:
+        """Return abandoned provider leases to the pending queue."""
+        now = utc_now()
+        with self.atomic_block():
             rows = self._connection.execute(
-                "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
-                (limit,)
+                """SELECT * FROM outbox_events
+                WHERE status='processing' AND lease_until IS NOT NULL AND lease_until<=?
+                ORDER BY created_at""",
+                (now,),
             ).fetchall()
-            
-            events = [self._decode_row(row) for row in rows] # type: ignore
-            if events:
-                event_ids = [e["id"] for e in events]
-                placeholders = ",".join("?" * len(event_ids))
+            for row in rows:
+                ambiguous_send = row["operation"] == "send_email"
+                status = "reconciliation_required" if ambiguous_send else "pending"
+                next_attempt = None if ambiguous_send else now
+                processed_at = now if ambiguous_send else None
                 self._connection.execute(
-                    f"UPDATE outbox_events SET status = 'processing' WHERE id IN ({placeholders})",
-                    event_ids
+                    """UPDATE outbox_events
+                    SET status=?,worker_id='',lease_until=NULL,next_attempt_at=?,updated_at=?,processed_at=?,
+                    error=CASE WHEN error='' THEN 'Worker lease expired before provider completion' ELSE error END
+                    WHERE id=? AND status='processing'""",
+                    (status, next_attempt, now, processed_at, row["id"]),
                 )
-                self._commit_if_needed()
-        return events
+        return [self.get_outbox_event(row["id"]) for row in rows]
 
-    def complete_outbox_event(self, event_id: str, error: str = "") -> None:
-        """Mark an outbox event as completed or failed."""
-        status = "failed" if error else "completed"
+    def claim_outbox_events(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 50,
+        lease_seconds: int = 120,
+        max_attempts: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Atomically lease eligible provider operations to one worker."""
+        if not worker_id.strip():
+            raise ValueError("Outbox worker_id is required")
+        limit = max(1, min(int(limit), 500))
+        lease_seconds = max(30, min(int(lease_seconds), 3600))
+        max_attempts = max(1, min(int(max_attempts), 20))
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        lease_until = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        claimed_ids: list[str] = []
+        with self.atomic_block():
+            rows = self._connection.execute(
+                """SELECT id FROM outbox_events
+                WHERE status='pending'
+                  AND attempt < ?
+                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                ORDER BY created_at ASC
+                LIMIT ?""",
+                (max_attempts, now, limit),
+            ).fetchall()
+            for row in rows:
+                cursor = self._connection.execute(
+                    """UPDATE outbox_events
+                    SET status='processing',attempt=attempt+1,worker_id=?,lease_until=?,updated_at=?
+                    WHERE id=? AND status='pending'
+                      AND (next_attempt_at IS NULL OR next_attempt_at<=?)""",
+                    (worker_id.strip(), lease_until, now, row["id"], now),
+                )
+                if cursor.rowcount == 1:
+                    claimed_ids.append(row["id"])
+            if not claimed_ids:
+                return []
+            placeholders = ",".join("?" for _ in claimed_ids)
+            claimed_rows = self._connection.execute(
+                f"SELECT * FROM outbox_events WHERE id IN ({placeholders}) ORDER BY created_at",
+                claimed_ids,
+            ).fetchall()
+        return [self._decode_row(row) for row in claimed_rows]  # type: ignore[misc]
+
+    def fetch_pending_outbox_events(
+        self,
+        limit: int = 50,
+        *,
+        worker_id: str = "legacy-outbox-worker",
+        lease_seconds: int = 120,
+        max_attempts: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Backward-compatible alias for the lease-based outbox claim API."""
+        self.recover_expired_outbox_events()
+        return self.claim_outbox_events(
+            worker_id=worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+        )
+
+    def complete_outbox_event(
+        self,
+        event_id: str,
+        error: str = "",
+        *,
+        worker_id: str = "",
+        receipt: dict[str, Any] | None = None,
+        retryable: bool = False,
+        reconciliation_required: bool = False,
+        max_attempts: int = 5,
+        base_delay_seconds: int = 30,
+    ) -> dict[str, Any]:
+        """Complete, retry, or dead-letter one leased provider operation."""
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        max_attempts = max(1, min(int(max_attempts), 20))
+        with self.atomic_block():
+            row = self._connection.execute(
+                "SELECT * FROM outbox_events WHERE id=?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown outbox event: {event_id}")
+            if worker_id and row["worker_id"] not in {"", worker_id}:
+                raise ValueError("Outbox lease belongs to another worker")
+            if row["status"] == "completed":
+                return self._decode_row(row)  # type: ignore[return-value]
+            if error:
+                attempt = int(row["attempt"] or 0)
+                if reconciliation_required:
+                    next_attempt = None
+                    status = "reconciliation_required"
+                    processed_at = now
+                elif retryable and attempt < max_attempts:
+                    delay = min(max(1, int(base_delay_seconds)) * (2 ** max(0, attempt - 1)), 3600)
+                    next_attempt = (now_dt + timedelta(seconds=delay)).isoformat()
+                    status = "pending"
+                    processed_at = None
+                else:
+                    next_attempt = None
+                    status = "failed"
+                    processed_at = now
+                self._connection.execute(
+                    """UPDATE outbox_events SET status=?,error=?,worker_id='',lease_until=NULL,
+                    next_attempt_at=?,updated_at=?,processed_at=? WHERE id=?""",
+                    (status, error[:4000], next_attempt, now, processed_at, event_id),
+                )
+            else:
+                self._connection.execute(
+                    """UPDATE outbox_events SET status='completed',error='',worker_id='',lease_until=NULL,
+                    next_attempt_at=NULL,receipt=?,updated_at=?,processed_at=? WHERE id=?""",
+                    (json.dumps(receipt or {}), now, now, event_id),
+                )
+        return self.get_outbox_event(event_id)
+
+    def resolve_outbox_reconciliation(
+        self,
+        event_id: str,
+        *,
+        resolution: str,
+        receipt: dict[str, Any] | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Resolve an ambiguous provider attempt after a human/provider check."""
+        if resolution not in {"completed", "failed", "requeue"}:
+            raise ValueError("Resolution must be completed, failed, or requeue")
+        now = utc_now()
+        event = self.get_outbox_event(event_id)
+        if event["status"] != "reconciliation_required":
+            raise ValueError("Outbox event is not awaiting reconciliation")
+        if resolution == "completed" and not receipt:
+            raise ValueError("A verified provider receipt is required to mark reconciliation completed")
         with self._lock:
-            self._connection.execute(
-                "UPDATE outbox_events SET status = ?, error = ?, processed_at = ? WHERE id = ?",
-                (status, error, utc_now(), event_id)
-            )
+            if resolution == "requeue":
+                self._connection.execute(
+                    """UPDATE outbox_events SET status='pending',worker_id='',lease_until=NULL,
+                    next_attempt_at=?,error=?,updated_at=?,processed_at=NULL WHERE id=?""",
+                    (now, reason[:4000], now, event_id),
+                )
+            else:
+                self._connection.execute(
+                    """UPDATE outbox_events SET status=?,worker_id='',lease_until=NULL,
+                    next_attempt_at=NULL,error=?,receipt=?,updated_at=?,processed_at=? WHERE id=?""",
+                    (
+                        resolution,
+                        reason[:4000],
+                        json.dumps(receipt or {}),
+                        now,
+                        now,
+                        event_id,
+                    ),
+                )
             self._commit_if_needed()
+        return self.get_outbox_event(event_id)
+
+    def resolve_message_reconciliation(self, message_id: str, *, resolution: str) -> dict[str, Any]:
+        """Move a quarantined outbound message to an explicit founder-selected state."""
+        status_by_resolution = {
+            "failed": "failed",
+            "requeue": "sending",
+        }
+        if resolution not in status_by_resolution:
+            raise ValueError("Message reconciliation resolution must be failed or requeue")
+        now = utc_now()
+        with self._lock:
+            cursor = self._connection.execute(
+                """UPDATE messages SET status=?,updated_at=?
+                WHERE id=? AND status='reconciliation_required'""",
+                (status_by_resolution[resolution], now, message_id),
+            )
+            if cursor.rowcount != 1:
+                message = self.get_message(message_id)
+                if message["status"] == status_by_resolution[resolution]:
+                    return message
+                raise ValueError(
+                    f"Message is {message['status']} and is not awaiting reconciliation"
+                )
+            self._commit_if_needed()
+        self.publish_event(
+            f"message.reconciliation_{resolution}",
+            message_id,
+            {"resolution": resolution},
+        )
+        return self.get_message(message_id)
+
+    def list_outbox_events(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        query = "SELECT * FROM outbox_events"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status=?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._lock:
+            rows = self._connection.execute(query, params).fetchall()
+        return [self._decode_row(row) for row in rows]  # type: ignore[misc]
 
     def list_events(self, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         query = "SELECT * FROM events"
@@ -1263,8 +1492,16 @@ class CompanyStore:
                 if message["status"] == "sent":
                     self._connection.rollback()
                     return self.get_message(message_id)
-                if message["status"] not in {"approved", "sending", "queued", "dispatching"}:
-                    raise ValueError("Only an approved, sending, queued, or dispatching message can be marked sent")
+                if message["status"] not in {
+                    "approved",
+                    "sending",
+                    "queued",
+                    "dispatching",
+                    "reconciliation_required",
+                }:
+                    raise ValueError(
+                        "Only an approved, sending, queued, dispatching, or reconciliation-required message can be marked sent"
+                    )
                 comparator = "='followup'" if is_followup else "!='followup'"
                 count = self._connection.execute(
                     f"""SELECT COUNT(*) FROM messages m JOIN leads l ON l.id=m.lead_id

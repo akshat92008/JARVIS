@@ -10,6 +10,13 @@ from typing import Any
 
 from jarvis.amaura.content_factory import ContentFactory
 from jarvis.amaura.evidence import EvidenceVault
+from jarvis.amaura.gitops import (
+    cleanup_task_worktree,
+    is_software_task,
+    merge_approved_task,
+    rollback_approved_merge,
+)
+from jarvis.amaura.integrations import ProviderReceipt, verify_provider_receipt
 from jarvis.amaura.model_gateway import ModelGateway
 from jarvis.amaura.models import (
     ApprovalStatus,
@@ -25,6 +32,7 @@ from jarvis.amaura.pipeline import AcquisitionPipeline
 from jarvis.amaura.policies import POLICIES
 from jarvis.amaura.policy import PolicyEngine
 from jarvis.amaura.registry import AGENTS_BY_ID, ALL_AGENTS, get_agent
+from jarvis.amaura.runtime import load_amaura_env
 from jarvis.amaura.store import CompanyStore
 from jarvis.amaura.telemetry import OperationalTelemetry
 from jarvis.amaura.workflows import WORKFLOWS, get_workflow
@@ -38,6 +46,7 @@ class AmauraControlPlane:
     """The only service allowed to create, delegate, review, or approve company work."""
 
     def __init__(self, db_path: str | Path | None = None, founder_id: str | None = None):
+        load_amaura_env()
         self.store = CompanyStore(db_path)
         self.founder_id = founder_id or os.environ.get("AMAURA_FOUNDER_ID", "founder")
         self.founder_name = os.environ.get("AMAURA_FOUNDER_NAME", "Akshat")
@@ -289,7 +298,12 @@ class AmauraControlPlane:
         if actor == task["owner_id"]:
             raise GovernanceError("No agent may certify its own work")
         if actor != self.founder_id:
-            from jarvis.amaura.evidence import verify_review_attestation
+            from jarvis.amaura.evidence import (
+                deterministic_evidence_review,
+                strict_review_enabled,
+                validate_criterion_review,
+                verify_review_attestation,
+            )
             if not attestation:
                 raise GovernanceError("Review attestation is required for non-founder reviewers")
             if not verify_review_attestation(attestation):
@@ -299,6 +313,25 @@ class AmauraControlPlane:
             attestation_decision = self._attestation_approves(attestation)
             if attestation_decision != approve:
                 raise GovernanceError("Attestation decision does not match review approval")
+            if strict_review_enabled(task):
+                current_deterministic = deterministic_evidence_review(task, self.evidence)
+                signed_deterministic = attestation.get("deterministic_review")
+                if not isinstance(signed_deterministic, dict):
+                    raise GovernanceError("Review attestation is missing deterministic evidence verification")
+                if signed_deterministic.get("submission_sha256") != current_deterministic["submission_sha256"]:
+                    raise GovernanceError("Review attestation was signed for a different task submission")
+                if bool(signed_deterministic.get("approve")) != bool(current_deterministic["approve"]):
+                    raise GovernanceError("Review attestation deterministic result is stale or inconsistent")
+                criterion_review = validate_criterion_review(
+                    task,
+                    dict(attestation.get("decision") or {}),
+                    self.evidence,
+                )
+                if approve and not criterion_review["ok"]:
+                    raise GovernanceError(
+                        "Review attestation does not prove every acceptance criterion: "
+                        + "; ".join(criterion_review["findings"])
+                    )
         if task["state"] != TaskState.AWAITING_REVIEW.value:
             raise GovernanceError("Task is not awaiting independent review")
         if not findings.strip():
@@ -307,13 +340,8 @@ class AmauraControlPlane:
             updated = self.store.update_work_item(task_id, state=TaskState.ASSIGNED.value, summary=f"REVIEW REJECTED: {findings.strip()}\n\nPrevious submission: {task['summary']}")
             self.store.publish_event("qa.rejected", task_id, {"reviewer": actor, "findings": findings})
             self.store.audit(actor, "review", "task", task_id, "rejected", {"findings": findings})
-            if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
-                import os
-                import subprocess
-                wt_path = f"/tmp/amaura-worktrees/{task_id}"
-                if os.path.exists(wt_path):
-                    subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
-                    subprocess.run(["git", "branch", "-D", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
+            if is_software_task(task) and task.get("metadata", {}).get("git_worktree_path"):
+                cleanup_task_worktree(task, require_clean=False)
             return updated
 
         gate = self.policy.completion_gate(task)
@@ -347,6 +375,20 @@ class AmauraControlPlane:
 
     @staticmethod
     def _approval_payload(task: dict[str, Any]) -> dict[str, Any]:
+        metadata = dict(task.get("metadata") or {})
+        git_snapshot = {
+            key: metadata.get(key)
+            for key in (
+                "git_repository_root",
+                "git_branch",
+                "git_base_branch",
+                "git_base_commit",
+                "git_commit",
+                "git_changed_files",
+                "post_merge_validation",
+            )
+            if metadata.get(key) not in (None, "", [])
+        }
         return {
             "title": task["title"],
             "summary": task["summary"],
@@ -355,6 +397,7 @@ class AmauraControlPlane:
             "spent_cents": task["spent_cents"],
             "action_type": task["action_type"],
             "risk": task["risk"],
+            "git_snapshot": git_snapshot,
         }
 
     def decide_approval(self, approval_id: str, actor: str, decision: str, reason: str) -> dict[str, Any]:
@@ -374,18 +417,79 @@ class AmauraControlPlane:
             raise GovernanceError("The approved task is no longer awaiting founder authority")
         current_payload = self._approval_payload(task_before_decision)
         if self.store.canonical_hash(current_payload) != approval_snapshot["payload_hash"]:
-            self.store.audit(actor, "decide_approval", "approval", approval_id, "denied", {"reason": "approval_payload_changed"})
-            raise GovernanceError("Approval payload changed after it was requested; request a fresh founder approval")
-        approval = self.store.resolve_approval(approval_id, status.value, actor, reason.strip())
-        task_id = approval["task_id"]
+            self.store.audit(
+                actor,
+                "decide_approval",
+                "approval",
+                approval_id,
+                "denied",
+                {"reason": "approval_payload_changed"},
+            )
+            raise GovernanceError(
+                "Approval payload changed after it was requested; request a fresh founder approval"
+            )
+
+        task_id = approval_snapshot["task_id"]
         if status is ApprovalStatus.APPROVED:
-            task = self._complete_task(task_id)
-        elif status in {ApprovalStatus.REJECTED, ApprovalStatus.CHANGES_REQUESTED}:
-            task = self.store.update_work_item(task_id, state=TaskState.BLOCKED.value)
-        else:
-            task = self.store.update_work_item(task_id, state=TaskState.AWAITING_APPROVAL.value)
-        self.store.publish_event(f"approval.{status.value}", approval_id, {"task_id": task_id, "reason": reason, "actor": actor})
-        self.store.audit(actor, "decide_approval", "approval", approval_id, status.value, {"reason": reason})
+            task = self._complete_task(
+                task_id,
+                approval_resolution=(approval_id, status.value, actor, reason.strip()),
+            )
+            approval = self.store.get_approval(approval_id)
+            return {"approval": approval, "task": task}
+
+        # Cleanup is an external side effect. Perform it before the atomic
+        # database transition so a failure leaves the approval pending.
+        if (
+            status is ApprovalStatus.REJECTED
+            and is_software_task(task_before_decision)
+            and task_before_decision.get("metadata", {}).get("git_worktree_path")
+        ):
+            cleanup_task_worktree(task_before_decision, require_clean=False)
+
+        with self.store.atomic_block():
+            approval = self.store.resolve_approval(
+                approval_id,
+                status.value,
+                actor,
+                reason.strip(),
+            )
+            if status is ApprovalStatus.REJECTED:
+                task = self.store.update_work_item(
+                    task_id,
+                    state=TaskState.BLOCKED.value,
+                    summary=(
+                        f"FOUNDER REJECTED: {reason.strip()}\n\n"
+                        f"Previous submission: {task_before_decision['summary']}"
+                    ),
+                )
+            elif status is ApprovalStatus.CHANGES_REQUESTED:
+                task = self.store.update_work_item(
+                    task_id,
+                    state=TaskState.ASSIGNED.value,
+                    summary=(
+                        f"CHANGES REQUESTED: {reason.strip()}\n\n"
+                        f"Previous submission: {task_before_decision['summary']}"
+                    ),
+                )
+            else:
+                task = self.store.update_work_item(
+                    task_id,
+                    state=TaskState.AWAITING_APPROVAL.value,
+                )
+            self.store.publish_event(
+                f"approval.{status.value}",
+                approval_id,
+                {"task_id": task_id, "reason": reason, "actor": actor},
+            )
+            self.store.audit(
+                actor,
+                "decide_approval",
+                "approval",
+                approval_id,
+                status.value,
+                {"reason": reason},
+            )
         return {"approval": approval, "task": task}
 
     def record_cost(self, task_id: str, agent_id: str, amount_cents: int, category: str, units: float = 0, unit_name: str = "", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -443,6 +547,103 @@ class AmauraControlPlane:
         self.store.publish_event("decision.recorded", decision_id, {"decision": decision, "owner": actor})
         self.store.audit(actor, "record_decision", "decision", decision_id, "allowed")
         return decision_id
+
+    def reconcile_outbox_event(
+        self,
+        event_id: str,
+        *,
+        resolution: str,
+        reason: str,
+        provider_receipt: ProviderReceipt | dict[str, Any] | None = None,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an ambiguous provider call through an explicit founder decision.
+
+        An uncertain email is never silently retried. A successful resolution needs
+        a signed provider receipt bound to the exact approved payload and idempotency
+        key; failed and requeue decisions remain fully audited.
+        """
+        actor = actor or self.founder_id
+        if actor != self.founder_id:
+            raise GovernanceError("Only the founder may reconcile external provider attempts")
+        if resolution not in {"completed", "failed", "requeue"}:
+            raise GovernanceError("Resolution must be completed, failed, or requeue")
+        if not reason.strip():
+            raise GovernanceError("A reconciliation reason is required")
+
+        event = self.store.get_outbox_event(event_id)
+        if event["status"] != "reconciliation_required":
+            raise GovernanceError("Outbox event is not awaiting reconciliation")
+
+        receipt: ProviderReceipt | None = None
+        if resolution == "completed":
+            if provider_receipt is None:
+                raise GovernanceError(
+                    "A signed provider receipt is required to mark an ambiguous action completed"
+                )
+            raw_receipt = (
+                provider_receipt
+                if isinstance(provider_receipt, ProviderReceipt)
+                else ProviderReceipt.from_dict(provider_receipt)
+            )
+            if event["operation"] == "send_email":
+                expected_payload = {
+                    "recipient": event["payload"].get("recipient", ""),
+                    "subject": event["payload"].get("subject", ""),
+                    "body": event["payload"].get("body", ""),
+                }
+                allowed_providers = {"gmail", "n8n"}
+                allowed_statuses = {"sent"}
+            elif event["operation"] == "create_private_draft":
+                expected_payload = event["payload"]
+                allowed_providers = {"private-publication"}
+                allowed_statuses = {"private", "draft"}
+            else:
+                raise GovernanceError(
+                    f"No reconciliation contract exists for operation: {event['operation']}"
+                )
+            if raw_receipt.provider not in allowed_providers:
+                raise GovernanceError("Provider receipt is not allowed for this operation")
+            receipt = verify_provider_receipt(
+                raw_receipt,
+                expected_operation=event["operation"],
+                expected_idempotency_key=event["idempotency_key"],
+                expected_payload=expected_payload,
+            )
+            if receipt.status not in allowed_statuses:
+                raise GovernanceError("Provider receipt does not prove the requested completion state")
+
+        message_id = str(event["payload"].get("message_id", "")).strip()
+        details = {
+            "resolution": resolution,
+            "reason": reason.strip(),
+            "operation": event["operation"],
+            "provider": receipt.provider if receipt else event["provider"],
+            "message_id": message_id,
+        }
+        with self.store.atomic_block():
+            if resolution == "completed" and message_id:
+                assert receipt is not None
+                self.acquisition.confirm_external_send(
+                    message_id,
+                    actor=actor,
+                    provider_receipt=receipt,
+                )
+
+            resolved = self.store.resolve_outbox_reconciliation(
+                event_id,
+                resolution=resolution,
+                receipt=receipt.to_dict() if receipt else None,
+                reason=reason.strip(),
+            )
+            if message_id and resolution in {"failed", "requeue"}:
+                self.store.resolve_message_reconciliation(
+                    message_id,
+                    resolution=resolution,
+                )
+            self.store.publish_event("outbox.reconciled", event_id, details)
+            self.store.audit(actor, "reconcile_outbox", "outbox_event", event_id, "allowed", details)
+        return resolved
 
     def dashboard(self) -> dict[str, Any]:
         dashboard = self.store.dashboard()
@@ -525,37 +726,117 @@ class AmauraControlPlane:
         if not self.store.get_agent(agent_id)["enabled"]:
             raise GovernanceError(f"Employee '{agent_id}' is paused and may not receive or execute work")
 
-    def _complete_task(self, task_id: str) -> dict[str, Any]:
+    def _complete_task(
+        self,
+        task_id: str,
+        *,
+        approval_resolution: tuple[str, str, str, str] | None = None,
+    ) -> dict[str, Any]:
+        # repository_write merges are delegated to gitops, which checks every subprocess returncode.
         task = self.store.get_work_item(task_id)
-        # P0-2: include repository_write so worktree merge/cleanup fires for builder/patch tasks.
-        if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and task["metadata"].get("workspace"):
-            import os
-            import subprocess
-            wt_path = f"/tmp/amaura-worktrees/{task_id}"
-            if os.path.exists(wt_path):
-                status_res = subprocess.run(["git", "status", "--porcelain"], cwd=wt_path, capture_output=True, text=True)
-                if status_res.stdout.strip():
-                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True)
-                    subprocess.run(["git", "commit", "-m", f"feat(amaura): completion task {task_id}"], cwd=wt_path, capture_output=True)
-                merge_result = subprocess.run(
-                    ["git", "merge", "--no-ff", f"amaura-{task_id}", "-m", f"Merge task {task_id}"],
-                    cwd=task["metadata"]["workspace"],
-                    capture_output=True,
-                )
-                if merge_result.returncode != 0:
-                    # P0-2: do NOT silently swallow a failed merge.
-                    raise GovernanceError(
-                        f"Git merge failed for task {task_id} — task completion blocked.\n"
-                        + merge_result.stderr.decode(errors="replace")
+        merge = None
+        if is_software_task(task) and task.get("metadata", {}).get("git_commit"):
+            merge = merge_approved_task(task, cleanup=False)
+        elif is_software_task(task) and os.environ.get("AMAURA_STRICT_GIT", "0") == "1":
+            raise GovernanceError(
+                "Strict launch mode blocks repository task completion without an approved Git commit"
+            )
+
+        try:
+            with self.store.atomic_block():
+                if merge is not None:
+                    merge_record = self.evidence.put_json(
+                        merge.to_dict(),
+                        source=f"task:{task_id}:merge_receipt",
                     )
-                subprocess.run(["git", "worktree", "remove", "-f", wt_path], cwd=task["metadata"]["workspace"], capture_output=True)
-                subprocess.run(["git", "branch", "-D", f"amaura-{task_id}"], cwd=task["metadata"]["workspace"], capture_output=True)
-                
-        task = self.store.update_work_item(task_id, state=TaskState.COMPLETED.value)
-        event = "release.ready" if task["action_type"] in {"production_deployment", "model_release"} else "task.completed"
-        self.store.publish_event(event, task_id, {"owner": task["owner_id"], "evidence": len(task["evidence"])})
-        self._roll_up(task["parent_id"])
-        return task
+                    merge_evidence = {
+                        "type": "git_merge_receipt",
+                        "reference": merge_record.reference,
+                        "sha256": merge_record.sha256,
+                        "byte_length": merge_record.byte_length,
+                        "success": True,
+                        "excerpt": (
+                            f"merged_head={merge.merged_head[:12]} branch={merge.branch}"
+                        ),
+                    }
+                    task = self.store.update_work_item(
+                        task_id,
+                        evidence=[*task["evidence"], merge_evidence],
+                        metadata={
+                            **dict(task.get("metadata") or {}),
+                            "git_merged_head": merge.merged_head,
+                            "git_previous_head": merge.previous_head,
+                        },
+                    )
+                    self.store.publish_event(
+                        "repository.merged",
+                        task_id,
+                        {
+                            "branch": merge.branch,
+                            "previous_head": merge.previous_head,
+                            "merged_head": merge.merged_head,
+                        },
+                    )
+
+                task = self.store.update_work_item(
+                    task_id,
+                    state=TaskState.COMPLETED.value,
+                )
+                if approval_resolution is not None:
+                    approval_id, decision, actor, reason = approval_resolution
+                    self.store.resolve_approval(
+                        approval_id,
+                        decision,
+                        actor,
+                        reason,
+                    )
+                    self.store.publish_event(
+                        f"approval.{decision}",
+                        approval_id,
+                        {"task_id": task_id, "reason": reason, "actor": actor},
+                    )
+                    self.store.audit(
+                        actor,
+                        "decide_approval",
+                        "approval",
+                        approval_id,
+                        decision,
+                        {"reason": reason},
+                    )
+                event = (
+                    "release.ready"
+                    if task["action_type"] in {"production_deployment", "model_release"}
+                    else "task.completed"
+                )
+                self.store.publish_event(
+                    event,
+                    task_id,
+                    {"owner": task["owner_id"], "evidence": len(task["evidence"])},
+                )
+                self._roll_up(task["parent_id"])
+        except Exception:
+            if merge is not None:
+                rollback_approved_merge(task, merge)
+            raise
+
+        if merge is not None:
+            try:
+                cleanup_task_worktree(task, require_clean=False)
+            except Exception as exc:  # cleanup is recoverable; do not undo completed work
+                self.store.publish_event(
+                    "repository.cleanup_required",
+                    task_id,
+                    {"branch": merge.branch, "error": str(exc)},
+                )
+                self.store.audit(
+                    "jarvis",
+                    "cleanup_task_worktree",
+                    "task",
+                    task_id,
+                    "warning",
+                    {"branch": merge.branch, "error": str(exc)},
+                )
+        return self.store.get_work_item(task_id)
 
     def _roll_up(self, parent_id: str | None) -> None:
         while parent_id:

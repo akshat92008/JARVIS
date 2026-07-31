@@ -123,7 +123,11 @@ def test_outbound_delivery_confirm_from_sending_state():
                 operation="send_email",
                 external_id="ext_msg_123",
                 idempotency_key=m_sending["idempotency_key"],
-                payload={"recipient": "ceo@acme.com", "body": "test"},
+                payload={
+                    "recipient": m_sending["recipient"],
+                    "subject": m_sending["subject"],
+                    "body": m_sending["body"],
+                },
                 status="sent",
             )
             confirmed = pipeline.confirm_external_send(msg["id"], actor="system", provider_receipt=receipt)

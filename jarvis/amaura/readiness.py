@@ -104,12 +104,18 @@ def _probe_ollama(
         }
 
 
-def _probe_docker() -> dict[str, Any]:
+def _probe_docker(image: str) -> dict[str, Any]:
     binary = shutil.which("docker")
     if not binary:
-        return {"installed": False, "healthy": False, "error": "not_installed"}
+        return {
+            "installed": False,
+            "healthy": False,
+            "image_available": False,
+            "image_smoke": False,
+            "error": "not_installed",
+        }
     try:
-        completed = subprocess.run(
+        daemon = subprocess.run(
             [binary, "info", "--format", "{{json .ServerVersion}}"],
             capture_output=True,
             text=True,
@@ -120,12 +126,78 @@ def _probe_docker() -> dict[str, Any]:
         return {
             "installed": True,
             "healthy": False,
+            "image_available": False,
+            "image_smoke": False,
+            "error": type(exc).__name__,
+        }
+    if daemon.returncode != 0:
+        return {
+            "installed": True,
+            "healthy": False,
+            "image_available": False,
+            "image_smoke": False,
+            "error": "daemon_unavailable",
+        }
+    try:
+        inspected = subprocess.run(
+            [binary, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if inspected.returncode != 0:
+            return {
+                "installed": True,
+                "healthy": True,
+                "image_available": False,
+                "image_smoke": False,
+                "error": "sandbox_image_missing",
+            }
+        smoke = subprocess.run(
+            [
+                binary,
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=128m",
+                image,
+                "sh",
+                "-lc",
+                (
+                    "python --version && python -m pytest --version && "
+                    "ruff --version && mypy --version && node --version && "
+                    "npm --version && git --version && rg --version"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "installed": True,
+            "healthy": True,
+            "image_available": True,
+            "image_smoke": False,
             "error": type(exc).__name__,
         }
     return {
         "installed": True,
-        "healthy": completed.returncode == 0,
-        "error": "" if completed.returncode == 0 else "daemon_unavailable",
+        "healthy": True,
+        "image_available": True,
+        "image_smoke": smoke.returncode == 0,
+        "error": "" if smoke.returncode == 0 else "sandbox_image_smoke_failed",
+        "smoke_stdout": smoke.stdout[-2000:],
+        "smoke_stderr": smoke.stderr[-2000:],
     }
 
 
@@ -143,8 +215,11 @@ def production_readiness(
     reviewer_model = os.environ.get("AMAURA_LOCAL_REVIEW_MODEL", "").strip()
     sandbox_mode = os.environ.get("AMAURA_SANDBOX_MODE", "docker").strip().lower()
     telegram_user = os.environ.get("TELEGRAM_USER_ID", "").strip()
+    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     prompts = load_prompt_catalogue()
     database = control.store.integrity_check()
+    dockerfile = Path(__file__).resolve().parents[2] / "docker" / "amaura-sandbox.Dockerfile"
+    dockerfile_text = dockerfile.read_text(encoding="utf-8") if dockerfile.is_file() else ""
 
     declared_tools = {tool for agent in ALL_AGENTS for tool in agent.tools}
     missing_tools = sorted(declared_tools - EXECUTABLE_EMPLOYEE_TOOLS)
@@ -178,12 +253,33 @@ def production_readiness(
             control.store.execution_status(),
             dict,
         ),
+        "leased_outbox_delivery": all(
+            hasattr(control.store, name)
+            for name in (
+                "claim_outbox_events",
+                "recover_expired_outbox_events",
+                "resolve_outbox_reconciliation",
+            )
+        ),
         "content_addressed_evidence": control.evidence.root.is_dir(),
         "durable_telemetry": isinstance(control.telemetry.snapshot(), dict),
         "sandbox_fail_closed": sandbox_mode == "docker"
         or (
             sandbox_mode == "host"
             and os.environ.get("AMAURA_ALLOW_HOST_EXECUTION") == "1"
+        ),
+        "sandbox_toolchain_contract": all(
+            token in dockerfile_text
+            for token in (
+                "python:3.12-slim-bookworm",
+                "node:22-bookworm-slim",
+                "git",
+                "ripgrep",
+                "pytest==",
+                "ruff==",
+                "mypy==",
+                "USER 10001:10001",
+            )
         ),
     }
     configuration_checks = {
@@ -209,7 +305,15 @@ def production_readiness(
         "loopback_binding": host in {"127.0.0.1", "localhost", "::1"},
         "remote_api_auth": host in {"127.0.0.1", "localhost", "::1"}
         or len(jarvis_key) >= 24,
-        "telegram_founder_bound": bool(telegram_user),
+        "telegram_founder_bound": not telegram_token or bool(telegram_user),
+        "experimental_langgraph_disabled": os.environ.get(
+            "AMAURA_ENABLE_EXPERIMENTAL_LANGGRAPH", "0"
+        ) != "1",
+        "strict_evidence_mode": os.environ.get("AMAURA_STRICT_EVIDENCE", "0") == "1",
+        "strict_review_mode": os.environ.get("AMAURA_STRICT_REVIEW", "0") == "1",
+        "strict_git_mode": os.environ.get("AMAURA_STRICT_GIT", "0") == "1",
+        "post_merge_validation": bool(os.environ.get("AMAURA_POST_MERGE_COMMAND", "").strip()),
+        "outbox_attempt_policy": int(os.environ.get("AMAURA_OUTBOX_MAX_ATTEMPTS", "3")) >= 1,
         "gmail_adapter": (
             os.environ.get("AMAURA_ENABLE_GMAIL") != "1"
             or bool(os.environ.get("AMAURA_GMAIL_ACCESS_TOKEN", ""))
@@ -241,12 +345,16 @@ def production_readiness(
             worker_model=worker_model,
             reviewer_model=reviewer_model,
         )
-        docker = _probe_docker()
+        docker = _probe_docker(
+            os.environ.get("AMAURA_SANDBOX_IMAGE", "amaura-sandbox:1.2.0")
+        )
         live_checks = {
             "ollama_reachable": ollama["reachable"],
             "worker_model_installed": ollama["worker_model_installed"],
             "reviewer_model_installed": ollama["reviewer_model_installed"],
             "docker_healthy": docker["healthy"],
+            "sandbox_image_available": docker["image_available"],
+            "sandbox_image_smoke": docker["image_smoke"],
         }
         live_details = {"ollama": ollama, "docker": docker}
     else:
@@ -278,6 +386,7 @@ def production_readiness(
                 "workflow_catalogue",
                 "founder_prompt_catalogue",
                 "durable_supervisor_store",
+                "leased_outbox_delivery",
             )
         ),
         "checks": all_checks,

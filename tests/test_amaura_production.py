@@ -137,15 +137,13 @@ class TestAmauraProductionControls(unittest.TestCase):
                     "findings": "Evidence independently verified.",
                     "criteria": [],
                 }
+                deterministic = deterministic_evidence_review(task, control.evidence)
                 attestation = create_review_attestation(
                     task_id=task["id"],
                     reviewer_id=task["reviewer_id"],
                     reviewer_model="reviewer-model",
                     decision=decision,
-                    deterministic_review={
-                        "approve": True,
-                        "submission_sha256": "b" * 64,
-                    },
+                    deterministic_review=deterministic,
                 )
                 updated = control.review_task(
                     task["id"],

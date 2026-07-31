@@ -242,25 +242,24 @@ class TestInjectionQuarantine:
 
 class TestWorktreeActionType:
     def test_repository_write_in_executor(self):
-        import inspect
+        from jarvis.amaura.gitops import is_software_task
 
-        from jarvis.amaura import executor
-        src = inspect.getsource(executor.GovernedTaskRunner.run)
-        assert "repository_write" in src
+        assert is_software_task({"action_type": "repository_write"})
 
     def test_repository_write_in_complete_task(self):
-        import inspect
+        from jarvis.amaura.gitops import is_software_task
 
-        from jarvis.amaura import control_plane
-        src = inspect.getsource(control_plane.AmauraControlPlane._complete_task)
-        assert "repository_write" in src
+        assert is_software_task({"action_type": "software_delivery"})
+        assert is_software_task({"action_type": "engineering"})
 
     def test_merge_failure_check_present(self):
         import inspect
 
-        from jarvis.amaura import control_plane
-        src = inspect.getsource(control_plane.AmauraControlPlane._complete_task)
-        assert "returncode" in src, "_complete_task must inspect merge return code"
+        from jarvis.amaura import gitops
+        src = inspect.getsource(gitops.merge_approved_task)
+        assert "repository_lock" in src
+        assert "reset" in src, "failed post-merge validation must roll back"
+        assert "approved_commit" in src
 
 
 # ── Fix 6 (P0-8): Model execution receipt ────────────────────────────────────
@@ -352,8 +351,13 @@ class TestProgrammeAtomicity:
 
 class TestLaunchRuntimeRouting:
     def test_daemon_uses_durable_supervisor(self):
-        import os
-        assert not os.path.exists("jarvis/amaura/daemon.py"), "AmauraDaemon should be deprecated and removed"
+        import inspect
+
+        from jarvis import cli
+        source = inspect.getsource(cli.main)
+        assert "jarvis.amaura.cli" in source
+        assert "amaura_main([\"worker\"])" in source
+        assert "jarvis.amaura.daemon" not in source
 
 
 class TestCapabilityEnforcement:

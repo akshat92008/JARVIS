@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-import inspect
 import json
-import logging
 import os
 import re
 import shlex
-import subprocess
-import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Callable, ClassVar
+from typing import Any, ClassVar
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.evidence import (
     create_review_attestation,
     deterministic_evidence_review,
+    validate_criterion_review,
+)
+from jarvis.amaura.gitops import (
+    finalize_task_commit,
+    is_git_repository,
+    is_software_task,
+    prepare_task_worktree,
 )
 from jarvis.amaura.models import GovernanceError, TaskState
 from jarvis.amaura.network import fetch_public_text
@@ -182,6 +184,7 @@ class GovernedTaskRunner:
         return json.dumps({"ok": True, "data": {"output": output}, "error": None, "external_id": "", "retryable": False})
 
     def run(self, task_id: str, max_iterations: int = 12) -> dict[str, Any]:
+        # repository_write tasks use the same isolated Git path as engineering delivery.
         max_iterations = max(1, min(max_iterations, 30))
         task = self.control.store.get_work_item(task_id)
         if task["state"] in {TaskState.ASSIGNED.value, TaskState.BLOCKED.value}:
@@ -192,19 +195,25 @@ class GovernedTaskRunner:
             raise GovernanceError(f"Task runner cannot execute state '{task['state']}'")
 
         packet_dict = self.control.task_packet(task_id, actor="jarvis")
-        # P0-2: include repository_write (used by builder/patch_engineer in workflows.py)
-        # in addition to software_delivery/engineering so worktrees are created correctly.
-        if task["action_type"] in {"software_delivery", "engineering", "repository_write"} and packet_dict.get("_workspace"):
-            workspace = packet_dict["_workspace"]
-            if os.path.isdir(os.path.join(workspace, ".git")):
-                wt_path = f"/tmp/amaura-worktrees/{task_id}"
-                os.makedirs("/tmp/amaura-worktrees", exist_ok=True)
-                if not os.path.exists(wt_path):
-                    res = subprocess.run(["git", "worktree", "add", "-B", f"amaura-{task_id}", wt_path, "HEAD"], cwd=workspace, capture_output=True)
-                    if res.returncode != 0:
-                        raise GovernanceError(f"Failed to create git worktree: {res.stderr.decode()}")
-                packet_dict["_workspace"] = wt_path
-                packet_dict["repository_context"]["workspace_dir"] = wt_path
+        if (
+            is_software_task(task)
+            and packet_dict.get("_workspace")
+            and is_git_repository(packet_dict["_workspace"])
+        ):
+            worktree = prepare_task_worktree(packet_dict["_workspace"], task_id)
+            metadata = {
+                **dict(task.get("metadata") or {}),
+                "git_repository_root": worktree.repository_root,
+                "git_worktree_path": worktree.worktree_path,
+                "git_branch": worktree.branch,
+                "git_base_branch": worktree.base_branch,
+                "git_base_commit": worktree.base_commit,
+            }
+            task = self.control.store.update_work_item(task_id, metadata=metadata)
+            packet_dict["_workspace"] = worktree.worktree_path
+            packet_dict["repository_context"]["workspace_dir"] = worktree.worktree_path
+        elif is_software_task(task) and os.environ.get("AMAURA_STRICT_GIT", "0") == "1":
+            raise GovernanceError("Repository-writing tasks require a clean Git repository in strict launch mode")
 
         route = packet_dict.pop("_model_route")
         workspace = packet_dict.pop("_workspace")
@@ -228,7 +237,10 @@ class GovernedTaskRunner:
         evidence: list[dict[str, Any]] = []
         final_response = ""
         iterations = 0
-        response = None  # holds last LLM response for model_execution_receipt (P0-8)
+        response = None  # holds the latest response for the final execution receipt
+        total_input_tokens = 0
+        total_output_tokens = 0
+        actual_models: list[str] = []
 
         sandbox = None
         sandbox_mode = os.environ.get("AMAURA_SANDBOX_MODE", "docker").strip().lower()
@@ -251,6 +263,12 @@ class GovernedTaskRunner:
             for iteration in range(1, max_iterations + 1):
                 iterations = iteration
                 response = client.chat_sync(model_id=model_cfg["id"], messages=messages, tools=tools if model_cfg.get("supports_tools") and tools else None)
+                usage = getattr(response, "usage", None)
+                total_input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+                total_output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+                actual_model = str(getattr(response, "model", route["model_key"]) or route["model_key"])
+                if actual_model not in actual_models:
+                    actual_models.append(actual_model)
                 choice = response.choices[0]
                 content = choice.message.content or ""
                 tool_calls = choice.message.tool_calls or []
@@ -316,30 +334,46 @@ class GovernedTaskRunner:
         if not final_response.strip():
             raise GovernanceError("Employee returned no completion summary")
 
-        if task["action_type"] in {"software_delivery", "engineering", "repository_write"}:
-            wt_path = f"/tmp/amaura-worktrees/{task_id}"
-            if os.path.exists(wt_path):
-                status_res = subprocess.run(["git", "status", "--porcelain"], cwd=wt_path, capture_output=True, text=True)
-                if status_res.stdout.strip():
-                    subprocess.run(["git", "add", "-A"], cwd=wt_path, capture_output=True)
-                    commit_msg = f"feat(amaura): {task.get('title', 'software update')} [{task_id}]"
-                    subprocess.run(["git", "commit", "-m", commit_msg], cwd=wt_path, capture_output=True)
-                rev_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt_path, capture_output=True, text=True)
-                rev = rev_res.stdout.strip()
-                diff_res = subprocess.run(["git", "diff", "HEAD~1"], cwd=wt_path, capture_output=True, text=True)
-                diff = diff_res.stdout or "Worktree commit created successfully."
-                commit_record = self.control.evidence.put_text(
-                    f"Commit: {rev}\n\nDiff:\n{diff[:5000]}",
-                    source=f"task:{task_id}:git_commit",
-                )
-                evidence.append({
+        if is_software_task(task) and task.get("metadata", {}).get("git_worktree_path"):
+            metadata = dict(task.get("metadata") or {})
+            from jarvis.amaura.gitops import WorktreeRecord
+
+            worktree = WorktreeRecord(
+                repository_root=str(metadata.get("git_repository_root", "")),
+                worktree_path=str(metadata.get("git_worktree_path", "")),
+                branch=str(metadata.get("git_branch", "")),
+                base_branch=str(metadata.get("git_base_branch", "")),
+                base_commit=str(metadata.get("git_base_commit", "")),
+            )
+            commit = finalize_task_commit(
+                worktree,
+                task_id=task_id,
+                title=str(task.get("title", "software update")),
+            )
+            metadata.update(
+                {
+                    "git_commit": commit.commit,
+                    "git_changed_files": list(commit.changed_files),
+                }
+            )
+            task = self.control.store.update_work_item(task_id, metadata=metadata)
+            commit_record = self.control.evidence.put_json(
+                commit.to_dict(),
+                source=f"task:{task_id}:git_commit",
+            )
+            evidence.append(
+                {
                     "type": "git_commit",
                     "reference": commit_record.reference,
                     "sha256": commit_record.sha256,
                     "byte_length": commit_record.byte_length,
                     "success": True,
-                    "excerpt": f"commit={rev[:8]} diff_len={len(diff)}",
-                })
+                    "excerpt": (
+                        f"commit={commit.commit[:12]} files={len(commit.changed_files)} "
+                        f"diff_bytes={len(commit.diff.encode('utf-8', errors='replace'))}"
+                    ),
+                }
+            )
 
         if not evidence:
             if task.get("acceptance_criteria"):
@@ -362,16 +396,16 @@ class GovernedTaskRunner:
         estimated_cost = route["estimated_cost_cents"]
         # P0-8: record the actual model and provider for every inference, not just the route name.
         # The provider may have remapped the requested model to a fallback.
-        last_usage = getattr(response, "usage", None) if response is not None else None
         model_execution_receipt = {
             "requested_route": route["model_key"],
-            "actual_model": getattr(response, "model", route["model_key"]) if response is not None else route["model_key"],
+            "actual_model": actual_models[-1] if actual_models else route["model_key"],
+            "models_used": actual_models,
             "provider": route["provider"],
             "fallback_model_key": route.get("fallback_model_key"),
             "sandbox_mode": sandbox_mode,
             "container_id": getattr(sandbox, "container_id", None) if sandbox else None,
-            "input_tokens": getattr(last_usage, "prompt_tokens", 0) if last_usage else 0,
-            "output_tokens": getattr(last_usage, "completion_tokens", 0) if last_usage else 0,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
             "estimated_cost_cents": estimated_cost,
             "iterations": iterations,
         }
@@ -477,7 +511,9 @@ class GovernedReviewRunner:
                 "content": (
                     reviewer.system_prompt + "\n\nAct as an independent verifier. Return exactly one JSON object with "
                     '"approve" (boolean), "findings" (non-empty string), and '
-                    '"criteria" (array of objects with criterion, passed, evidence).'
+                    '"criteria" (one object per acceptance criterion). Each criterion object must contain '
+                    '"criterion_index" (1-based integer), "criterion" (exact text), "passed" (boolean), '
+                    '"evidence_refs" (array containing only submitted evidence://sha256 references), and "notes".'
                 ),
             },
             {"role": "user", "content": "INDEPENDENT REVIEW PACKET:\n" + json.dumps(review_packet, indent=2)},
@@ -489,6 +525,7 @@ class GovernedReviewRunner:
         findings = decision.get("findings")
         if not isinstance(approve, bool) or not isinstance(findings, str) or not findings.strip():
             raise GovernanceError("Reviewer decision is missing approve/findings")
+        criterion_review = validate_criterion_review(task, decision, self.control.evidence)
         if not deterministic["approve"]:
             approve = False
             deterministic_findings = "; ".join(deterministic["findings"])
@@ -496,10 +533,18 @@ class GovernedReviewRunner:
                 "Rejected by deterministic evidence verification: "
                 f"{deterministic_findings}. {findings.strip()}"
             )
+        if not criterion_review["ok"]:
+            approve = False
+            findings = (
+                "Rejected by criterion coverage verification: "
+                + "; ".join(criterion_review["findings"])
+                + ". "
+                + findings.strip()
+            )
         decision = {
             "approve": approve,
             "findings": findings.strip(),
-            "criteria": decision.get("criteria", []),
+            "criteria": criterion_review["criteria"],
         }
         attestation = create_review_attestation(
             task_id=task_id,
@@ -519,6 +564,7 @@ class GovernedReviewRunner:
             {
                 "model": model_id,
                 "criteria": decision.get("criteria", []),
+                "criterion_review": criterion_review,
                 "failed_evidence": len(failed_evidence),
                 "submission_sha256": deterministic["submission_sha256"],
                 "attestation_signature": attestation["signature"],
@@ -532,6 +578,7 @@ class GovernedReviewRunner:
             "findings": findings.strip(),
             "state": updated["state"],
             "criteria": decision.get("criteria", []),
+            "criterion_review": criterion_review,
             "deterministic_review": deterministic,
             "attestation": attestation,
         }

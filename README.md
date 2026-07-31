@@ -6,7 +6,7 @@ Control your Mac with voice, generate documents, research the web, write code, a
 
 ## 🏢 Amaura Studio Company OS
 
-JARVIS is also the master control plane for Amaura Studio's governed 15-role AI workforce. It converts founder objectives into programmes, assigns narrow specialist tasks, enforces tool/data/cost authority, requires independent review, and routes sensitive actions to founder approval. The system includes durable tasks, events, audit history, policies, model routing, workflows, dashboards, Telegram approvals, and daily briefings.
+JARVIS is also the master control plane for Amaura Labs' governed 43-role internal AI workforce. It converts founder objectives into programmes, assigns narrow specialist tasks, enforces tool/data/cost authority, requires independent criterion-level review, and routes sensitive actions to founder approval. The system includes durable tasks, leased execution, crash-safe provider outboxes, content-addressed evidence, audit history, model routing, isolated Git delivery, dashboards, optional founder-bound Telegram approvals, and daily briefings.
 
 See [docs/AMAURA_STUDIO.md](docs/AMAURA_STUDIO.md) for the operating model, configuration, workflows, and API.
 
@@ -26,12 +26,12 @@ export NVIDIA_API_KEY="your-key-here"
 # Or with Python directly:
 python -m jarvis
 
-# Advance the internal workforce using local Nova/Ollama
-export AMAURA_MODEL_MODE=local
-export AMAURA_LOCAL_MODEL=nova:3b
-export AMAURA_LOCAL_REVIEW_MODEL=qwen2.5-coder:3b
-python -m jarvis.amaura.supervisor --drain
+# Amaura internal workforce on macOS
+./Install_Amaura.command
+./Launch_Amaura.command
 ```
+
+Amaura uses a fail-closed operator workflow. See [AMAURA_LAUNCH.md](AMAURA_LAUNCH.md) for prerequisites, the readiness gate, shadow-mode operation, backups, and recovery. For the first controlled execution, use `.venv/bin/amaura worker --once` rather than starting the continuous supervisor immediately.
 
 ## 🎙️ Voice Mode
 

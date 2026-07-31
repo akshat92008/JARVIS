@@ -135,7 +135,11 @@ class TestAmauraGrowthSystem(unittest.TestCase):
                 operation="send_email",
                 external_id="gmail-123",
                 idempotency_key=message["idempotency_key"],
-                payload={"test": True},
+                payload={
+                    "recipient": message["recipient"],
+                    "subject": message["subject"],
+                    "body": message["body"],
+                },
                 status="sent",
             )
             sent = self.pipeline.confirm_external_send(
@@ -181,7 +185,11 @@ class TestAmauraGrowthSystem(unittest.TestCase):
                     operation=operation,
                     external_id=f"{provider}-123",
                     idempotency_key=message["idempotency_key"],
-                    payload={"test": True},
+                    payload={
+                        "recipient": message["recipient"],
+                        "subject": message["subject"],
+                        "body": message["body"],
+                    },
                     status="sent",
                 )
                 sent = self.pipeline.confirm_external_send(

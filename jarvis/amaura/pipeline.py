@@ -16,7 +16,6 @@ from urllib.parse import urlsplit
 from jarvis.amaura.integrations import (
     GmailAdapter,
     N8nEmailAdapter,
-    PrivatePublicationAdapter,
     ProviderReceipt,
     verify_provider_receipt,
 )
@@ -335,8 +334,18 @@ class AcquisitionPipeline:
         message = self.store.get_message(message_id)
         if message["status"] == "sent":
             return message
-        if message["status"] not in {"approved", "sending", "queued", "dispatching"}:
+        if message["status"] not in {
+            "approved",
+            "sending",
+            "queued",
+            "dispatching",
+            "reconciliation_required",
+        }:
             raise GovernanceError(f"Message status '{message['status']}' cannot be confirmed as sent")
+        if message["status"] == "reconciliation_required" and provider_receipt is None:
+            raise GovernanceError(
+                "A reconciliation-required message can only be completed with a signed provider receipt"
+            )
         provider_name = "manual-break-glass"
         if provider_receipt is not None:
             raw_receipt = (
@@ -353,6 +362,11 @@ class AcquisitionPipeline:
                 raw_receipt,
                 expected_operation=raw_receipt.operation,
                 expected_idempotency_key=message["idempotency_key"],
+                expected_payload={
+                    "recipient": message["recipient"],
+                    "subject": message["subject"],
+                    "body": message["body"],
+                },
             )
             if receipt.status != "sent":
                 raise GovernanceError(
