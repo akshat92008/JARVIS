@@ -259,6 +259,7 @@ def production_readiness(
     return {
         "production_ready": not blockers,
         "source_certified": not source_blockers,
+        "source_ready": not source_blockers,
         "core_operational": all(
             source_checks[name]
             for name in (

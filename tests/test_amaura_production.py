@@ -331,7 +331,7 @@ class TestAmauraProductionControls(unittest.TestCase):
                 control = AmauraControlPlane(Path(directory) / "amaura.db")
                 report = production_readiness(control, live=False)
                 control.close()
-        self.assertTrue(report["source_ready"])
+        self.assertTrue(report["source_certified"])
         self.assertEqual(report["source_blockers"], [])
         self.assertEqual(report["live_checks"], {})
 

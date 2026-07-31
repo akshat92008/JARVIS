@@ -64,6 +64,7 @@ TOOL_RISK_CLASSES = {
         "amaura_stage_outreach",
         "amaura_register_content_asset",
         "amaura_record_content_metrics",
+        "amaura_update_crm",
     },
     "R3": {"send_email", "send_message", "schedule_post", "publish_content", "create_gmail_draft"},
     "R4": {"payment", "refund", "delete_data", "production_deploy"},
@@ -84,7 +85,7 @@ CAPABILITY_RULES: dict[str, set[str]] = {
     "download_approved_assets": {"amaura_register_content_asset"},
     "render_media": {"amaura_register_content_asset"},
     "approve_or_reject": {"amaura_transition_lead", "amaura_register_content_asset"},
-    "update_crm": {"amaura_transition_lead"},
+    "update_crm": {"amaura_transition_lead", "amaura_update_crm"},
 }
 
 

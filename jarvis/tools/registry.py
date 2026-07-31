@@ -71,14 +71,24 @@ ALL_DISPATCH = {
 }
 
 
+import json
+
+
 def execute_tool(name: str, args: dict) -> str:
     """Execute a tool by name with the given arguments."""
-    if name in ALL_DISPATCH:
-        try:
-            return ALL_DISPATCH[name](**args)
-        except Exception as e:
-            return f"❌ Tool error ({name}): {e}"
-    return f"❌ Unknown tool: {name}"
+    if name not in ALL_DISPATCH:
+        return json.dumps({"ok": False, "data": {}, "error": f"Unknown tool: {name}", "external_id": "", "retryable": False})
+    try:
+        result = ALL_DISPATCH[name](**args)
+        if isinstance(result, dict) and "ok" in result:
+            return json.dumps(result)
+        if isinstance(result, str):
+            if result.startswith("❌"):
+                return json.dumps({"ok": False, "data": {}, "error": result, "external_id": "", "retryable": False})
+            return json.dumps({"ok": True, "data": {"output": result}, "error": None, "external_id": "", "retryable": False})
+        return json.dumps({"ok": True, "data": {"output": str(result)}, "error": None, "external_id": "", "retryable": False})
+    except Exception as e:
+        return json.dumps({"ok": False, "data": {}, "error": f"Tool error ({name}): {e}", "external_id": "", "retryable": False})
 
 
 def get_tool_count() -> dict:

@@ -13,6 +13,7 @@ from typing import Any
 
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.executor import GovernedReviewRunner, GovernedTaskRunner
+from jarvis.amaura.integrations import dispatch_outbox_event
 from jarvis.amaura.models import GovernanceError, TaskState
 
 RunnerFactory = Callable[[AmauraControlPlane], GovernedTaskRunner]
@@ -70,6 +71,35 @@ class AmauraSupervisor:
             return self._tick(workflow_id=workflow_id)
 
     def _tick(self, *, workflow_id: str | None = None) -> dict[str, Any]:
+        # Process pending outbox events first
+        outbox_events = self.control.store.fetch_pending_outbox_events(limit=10)
+        dispatched_events = []
+        for event in outbox_events:
+            try:
+                receipt = dispatch_outbox_event(event)
+                
+                # If this was an email, we need to confirm the pipeline message
+                if event["operation"] == "send_email":
+                    payload = event["payload"]
+                    self.control.acquisition.confirm_external_send(
+                        message_id=payload["message_id"],
+                        actor=payload.get("actor", "jarvis"),
+                        provider_receipt=receipt,
+                    )
+                    
+                self.control.store.complete_outbox_event(event["id"])
+                dispatched_events.append({"id": event["id"], "status": "success", "receipt": receipt})
+            except Exception as exc:
+                self.control.store.complete_outbox_event(event["id"], error=str(exc))
+                dispatched_events.append({"id": event["id"], "status": "failed", "error": str(exc)})
+                self.control.telemetry.alert(
+                    severity="warning",
+                    code="outbox_dispatch_failed",
+                    message="Failed to dispatch outbox event.",
+                    resource_id=event["id"],
+                    details={"provider": event["provider"], "operation": event["operation"], "error": str(exc)}
+                )
+
         recovered = self.control.store.recover_expired_executions(
             max_attempts=self.max_attempts
         )
@@ -140,7 +170,7 @@ class AmauraSupervisor:
             workflow_id=workflow_id,
         )
         if claim is None:
-            return {"status": "idle", "recovered": recovered}
+            return {"status": "idle", "recovered": recovered, "outbox_dispatched": dispatched_events}
 
         run = claim["run"]
         task = claim["task"]
@@ -191,6 +221,7 @@ class AmauraSupervisor:
             return {
                 "status": "executed",
                 "recovered": recovered,
+                "outbox_dispatched": dispatched_events,
                 "execution": execution,
                 "result": result,
             }
@@ -247,6 +278,7 @@ class AmauraSupervisor:
             return {
                 "status": outcome,
                 "recovered": recovered,
+                "outbox_dispatched": dispatched_events,
                 "execution": execution,
                 "task_id": task["id"],
                 "error": str(exc),

@@ -138,3 +138,23 @@ class CanonicalTaskPacket(BaseModel):
     action_type: str
     repository_context: RepositoryContext
     doctrine: list[str]
+
+class ContentCampaign(BaseModel):
+    id: str
+    title: str
+    audience: str
+    business_objective: str
+    status: str = "draft"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+class ContentAsset(BaseModel):
+    id: str
+    campaign_id: str
+    asset_type: str
+    uri: str
+    sha256: str
+    status: str = "draft"
+    source_url: str = ""
+    creator: str = ""
+    licence: str = ""
+    asset_metadata: dict[str, Any] = Field(default_factory=dict)

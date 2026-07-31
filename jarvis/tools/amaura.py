@@ -187,14 +187,13 @@ AMAURA_TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "amaura_review_task",
-            "description": "Record an independent reviewer decision. The reviewer identity is automatically derived from the execution context.",
+            "description": "Trigger the automated independent reviewer for a task. The reviewer identity and decision are derived automatically.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
-                    "approve": {"type": "boolean"}, "findings": {"type": "string"},
                 },
-                "required": ["task_id", "approve", "findings"],
+                "required": ["task_id"],
             },
         },
     },
@@ -466,10 +465,11 @@ def supervisor_tick(workflow_id: str = "", automatic_reviews: bool = True) -> st
     ).tick(workflow_id=workflow_id or None))
 
 
-def review_task(task_id: str, approve: bool, findings: str) -> str:
+def review_task(task_id: str) -> str:
+    from jarvis.amaura.executor import GovernedReviewRunner
     control = get_control_plane()
-    task = control.store.get_work_item(task_id)
-    return _json(get_amaura_bus().execute(cmd.ReviewTaskCommand(task_id=task_id, actor=task["reviewer_id"], approve=approve, findings=findings, attestation=None)))
+    result = GovernedReviewRunner(control).run(task_id)
+    return _json(result)
 
 
 def pending_approvals() -> str:

@@ -7,16 +7,14 @@ import uuid
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
-from jarvis.amaura.models import GovernanceError
+from jarvis.amaura.models import ContentCampaign, ContentAsset, GovernanceError
 from jarvis.amaura.store import CompanyStore
 
 REQUIRED_PUBLICATION_ASSETS = {"master", "claim_map", "licence_inventory", "qa_report", "metadata"}
 MEASUREMENT_WINDOWS = {"24h", "72h", "7d", "30d"}
 
-
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
-
 
 class ContentFactory:
     """Govern content artefacts independently from model-generated prose."""
@@ -29,10 +27,15 @@ class ContentFactory:
                         business_objective: str, config: dict | None = None) -> dict:
         if not all(value.strip() for value in (campaign_id, title, audience, business_objective)):
             raise GovernanceError("Content campaign id, title, audience, and business objective are required")
-        campaign = self.store.create_content_campaign({
+        payload = {
             "id": campaign_id, "title": title.strip(), "audience": audience.strip(),
             "business_objective": business_objective.strip(), "config": config or {},
-        })
+        }
+        try:
+            validated = ContentCampaign.model_validate(payload)
+            campaign = self.store.create_content_campaign(validated.model_dump())
+        except Exception as exc:
+            raise GovernanceError(f"Invalid campaign schema: {exc}")
         self.store.publish_event("content.campaign.created", campaign_id, {
             "audience": audience, "business_objective": business_objective,
         })
@@ -56,13 +59,19 @@ class ContentFactory:
             raise GovernanceError("Unsupported asset URI scheme")
         if status not in {"draft", "approved", "rejected"}:
             raise GovernanceError("Invalid content asset status")
+        payload = {
+            "id": _id("asset"), "campaign_id": campaign_id, "asset_type": asset_type.strip(),
+            "uri": uri.strip(), "sha256": digest, "source_url": source_url.strip(),
+            "creator": creator.strip(), "licence": licence.strip(), "status": status,
+            "asset_metadata": metadata or {},
+        }
         try:
-            return self.store.add_content_asset({
-                "id": _id("asset"), "campaign_id": campaign_id, "asset_type": asset_type.strip(),
-                "uri": uri.strip(), "sha256": digest, "source_url": source_url.strip(),
-                "creator": creator.strip(), "licence": licence.strip(), "status": status,
-                "asset_metadata": metadata or {},
-            })
+            validated = ContentAsset.model_validate(payload)
+            payload_to_store = validated.model_dump()
+        except Exception as exc:
+            raise GovernanceError(f"Invalid asset schema: {exc}")
+        try:
+            return self.store.add_content_asset(payload_to_store)
         except Exception as exc:
             if "UNIQUE constraint" in str(exc):
                 raise GovernanceError("This exact campaign asset is already registered") from exc

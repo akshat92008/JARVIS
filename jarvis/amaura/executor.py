@@ -107,10 +107,13 @@ class GovernedTaskRunner:
         sandbox: StatefulDockerSandbox | None = None,
     ) -> str:
         if tool_name == "web_fetch":
-            return fetch_public_text(
+            result = fetch_public_text(
                 str(args["url"]),
                 max_length=int(args.get("max_length", 10_000)),
             )
+            if result.startswith("❌"):
+                return json.dumps({"ok": False, "data": {}, "error": result, "external_id": "", "retryable": False})
+            return json.dumps({"ok": True, "data": {"output": result}, "error": None, "external_id": "", "retryable": False})
         if tool_name not in {"run_command", "run_tests", "lint_code"}:
             return execute_tool(tool_name, args)
         if tool_name == "run_tests":
@@ -168,14 +171,14 @@ class GovernedTaskRunner:
                     timeout=timeout,
                 )
         except GovernanceError as exc:
-            return f"❌ Cannot execute command: {exc}"
+            return json.dumps({"ok": False, "data": {}, "error": f"Cannot execute command: {exc}", "external_id": "", "retryable": False})
         output = completed.stdout
         if completed.stderr:
             output += ("\n" if output else "") + completed.stderr
         output = output.strip() or "(no output)"
         if completed.returncode != 0:
-            return f"❌ Command failed (exit code {completed.returncode}):\n{output}"
-        return output
+            return json.dumps({"ok": False, "data": {}, "error": f"Command failed (exit code {completed.returncode}):\n{output}", "external_id": "", "retryable": False})
+        return json.dumps({"ok": True, "data": {"output": output}, "error": None, "external_id": "", "retryable": False})
 
     def run(self, task_id: str, max_iterations: int = 12) -> dict[str, Any]:
         max_iterations = max(1, min(max_iterations, 30))
@@ -280,6 +283,16 @@ class GovernedTaskRunner:
                         result,
                         source=f"task:{task_id}:tool:{call.function.name}",
                     )
+                    try:
+                        parsed_result = json.loads(result)
+                        success = parsed_result.get("ok", False)
+                        excerpt_str = str(parsed_result.get("data", {}).get("output", result))
+                        if parsed_result.get("error"):
+                            excerpt_str += "\nError: " + str(parsed_result["error"])
+                    except Exception:
+                        success = not result.startswith("❌")
+                        excerpt_str = result
+
                     evidence.append(
                         {
                             "type": "tool_result",
@@ -287,8 +300,8 @@ class GovernedTaskRunner:
                             "sha256": record.sha256,
                             "byte_length": record.byte_length,
                             "tool": call.function.name,
-                            "success": not result.startswith("❌"),
-                            "excerpt": result[:500],
+                            "success": success,
+                            "excerpt": excerpt_str[:500],
                         }
                     )
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": result})

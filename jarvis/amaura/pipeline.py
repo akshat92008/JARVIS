@@ -426,18 +426,20 @@ class AcquisitionPipeline:
         self.store.mark_message_sending(message_id)
         try:
             if message["channel"] == "email":
-                email_adapter = adapter or (N8nEmailAdapter() if os.environ.get("USE_N8N") == "1" else GmailAdapter())
-                receipt = email_adapter.send(
-                    recipient=message["recipient"],
-                    subject=message["subject"],
-                    body=message["body"],
+                payload = {
+                    "message_id": message_id,
+                    "recipient": message["recipient"],
+                    "subject": message["subject"],
+                    "body": message["body"],
+                    "actor": actor,
+                }
+                self.store.enqueue_outbox_event(
+                    provider="auto",
+                    operation="send_email",
+                    payload=payload,
                     idempotency_key=message["idempotency_key"],
                 )
-                return self.confirm_external_send(
-                    message_id,
-                    actor=actor,
-                    provider_receipt=receipt,
-                )
+                return {"status": "enqueued", "message_id": message_id}
             if message["channel"] == "imessage":
                 from jarvis.tools.communication import tool_send_imessage
                 result = tool_send_imessage(message["recipient"], message["body"])

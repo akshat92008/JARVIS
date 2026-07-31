@@ -251,10 +251,22 @@ class N8nEmailAdapter:
                 "idempotency_key": idempotency_key
             }
         )
-        if result.get("status") == "error":
-            raise GovernanceError(f"n8n email delivery failed: {result.get('error')}")
+        if not result or result.get("status") == "error":
+            error_msg = result.get('error') if isinstance(result, dict) else 'Unknown error'
+            raise GovernanceError(f"n8n email delivery failed: {error_msg}")
+        
+        if not isinstance(result, dict):
+            raise GovernanceError("n8n webhook did not return a JSON object")
+        if result.get("status") != "success":
+            raise GovernanceError("n8n webhook did not return explicit success status")
+        if not result.get("id"):
+            raise GovernanceError("n8n webhook did not return a real provider message ID")
+        if result.get("recipient") != recipient:
+            raise GovernanceError("n8n webhook did not confirm the correct recipient")
+        if result.get("idempotency_key") != idempotency_key:
+            raise GovernanceError("n8n webhook did not confirm the correct idempotency key")
             
-        external_id = str(result.get("id", idempotency_key)).strip()
+        external_id = str(result["id"]).strip()
         thread_id = str(result.get("threadId", "")).strip()
         
         return ProviderReceipt.issue(
@@ -369,6 +381,54 @@ def verify_provider_receipt(
         if not hmac.compare_digest(receipt.payload_sha256, expected_hash):
             raise GovernanceError("Provider receipt payload does not match")
     return receipt
+
+
+class ProviderMatrix:
+    """Dispatches outbox events to the appropriate configured provider."""
+    
+    def __init__(self):
+        self.gmail = GmailAdapter()
+        self.n8n = N8nEmailAdapter()
+        self.private_pub = PrivatePublicationAdapter()
+
+    def dispatch(self, event: dict[str, Any]) -> ProviderReceipt:
+        provider = event["provider"]
+        operation = event["operation"]
+        payload = event["payload"]
+        idempotency_key = event["idempotency_key"]
+
+        if operation == "send_email":
+            # Priority: n8n first if configured, then Gmail
+            if provider == "n8n" or (provider == "auto" and self.n8n.configured):
+                return self.n8n.send(
+                    recipient=payload["recipient"],
+                    subject=payload["subject"],
+                    body=payload["body"],
+                    idempotency_key=idempotency_key,
+                    sender=payload.get("sender", ""),
+                )
+            elif provider == "gmail" or (provider == "auto" and self.gmail.configured):
+                return self.gmail.send(
+                    recipient=payload["recipient"],
+                    subject=payload["subject"],
+                    body=payload["body"],
+                    idempotency_key=idempotency_key,
+                    sender=payload.get("sender", ""),
+                )
+            raise GovernanceError(f"No configured provider for send_email (requested: {provider})")
+            
+        elif operation == "create_private_draft":
+            return self.private_pub.create_private_draft(
+                payload=payload,
+                idempotency_key=idempotency_key,
+            )
+            
+        raise GovernanceError(f"Unknown operation in matrix: {operation}")
+
+
+def dispatch_outbox_event(event: dict[str, Any]) -> ProviderReceipt:
+    matrix = ProviderMatrix()
+    return matrix.dispatch(event)
 
 
 __all__ = [

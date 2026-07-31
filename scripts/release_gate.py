@@ -70,7 +70,7 @@ def _run(static_only: bool) -> dict[str, Any]:
             and all(item["ready"] for item in evaluations)
         )
     )
-    source_certified = bool(readiness["source_ready"]) and bool(security["ok"])
+    source_certified = bool(readiness["source_certified"]) and bool(security["ok"])
     production_ready = (
         source_certified
         and not static_only

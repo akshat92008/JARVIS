@@ -70,6 +70,7 @@ class CompanyStore:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._autocommit = True  # set False inside atomic_block to batch commits
+        self._savepoints = 0
         self._migrate()
 
     def close(self) -> None:
@@ -82,23 +83,32 @@ class CompanyStore:
 
         Within the block, individual operations skip their per-row commits.
         On exit the transaction is committed; on exception it is rolled back.
-        This ensures compound operations (e.g. programme creation) are all-or-nothing.
+        Supports nested transactions using SQLite SAVEPOINTs (P0-3).
         """
         with self._lock:
-            nested = self._connection.in_transaction
-            if not nested:
+            is_outer = (self._savepoints == 0)
+            
+            if is_outer:
                 self._connection.execute("BEGIN IMMEDIATE")
                 self._autocommit = False
+            
+            self._savepoints += 1
+            sp_name = f"sp_{self._savepoints}"
+            self._connection.execute(f"SAVEPOINT {sp_name}")
+            
             try:
                 yield
-                if not nested:
+                self._connection.execute(f"RELEASE SAVEPOINT {sp_name}")
+                if is_outer:
                     self._connection.commit()
             except Exception:
-                if not nested:
+                self._connection.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                if is_outer:
                     self._connection.rollback()
                 raise
             finally:
-                if not nested:
+                self._savepoints -= 1
+                if is_outer:
                     self._autocommit = True
 
     def _commit_if_needed(self) -> None:
@@ -469,6 +479,18 @@ class CompanyStore:
         );
         CREATE INDEX IF NOT EXISTS idx_operational_alerts_status
             ON operational_alerts(status, created_at);
+            CREATE TABLE IF NOT EXISTS outbox_events (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                processed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_events(status, created_at);
         """
         with self._lock:
             self._connection.executescript(schema)
@@ -798,6 +820,62 @@ class CompanyStore:
             cursor = self._connection.execute("INSERT INTO events(event_type, aggregate_id, payload, created_at) VALUES(?, ?, ?, ?)", (event_type, aggregate_id, json.dumps(payload), created_at))
             self._commit_if_needed()
         return {"sequence": cursor.lastrowid, "event_type": event_type, "aggregate_id": aggregate_id, "payload": payload, "created_at": created_at}
+
+    def enqueue_outbox_event(self, provider: str, operation: str, payload: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+        """Enqueue an event for out-of-band delivery via the provider matrix."""
+        now = utc_now()
+        event_id = f"outbox_{uuid.uuid4().hex[:16]}"
+        with self._lock:
+            try:
+                self._connection.execute(
+                    "INSERT INTO outbox_events(id, idempotency_key, provider, operation, payload, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+                    (event_id, idempotency_key, provider, operation, json.dumps(payload), now),
+                )
+                self._commit_if_needed()
+            except sqlite3.IntegrityError:
+                # If the idempotency key already exists, return the existing event
+                row = self._connection.execute("SELECT * FROM outbox_events WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+                if row:
+                    return self._decode_row(row) # type: ignore
+                raise
+        return self.get_outbox_event(event_id)
+
+    def get_outbox_event(self, event_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute("SELECT * FROM outbox_events WHERE id = ?", (event_id,)).fetchone()
+        decoded = self._decode_row(row)
+        if decoded is None:
+            raise KeyError(f"Unknown outbox event: {event_id}")
+        return decoded
+
+    def fetch_pending_outbox_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Fetch pending outbox events. Mark them as 'processing' so they are not fetched concurrently."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM outbox_events WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            
+            events = [self._decode_row(row) for row in rows] # type: ignore
+            if events:
+                event_ids = [e["id"] for e in events]
+                placeholders = ",".join("?" * len(event_ids))
+                self._connection.execute(
+                    f"UPDATE outbox_events SET status = 'processing' WHERE id IN ({placeholders})",
+                    event_ids
+                )
+                self._commit_if_needed()
+        return events
+
+    def complete_outbox_event(self, event_id: str, error: str = "") -> None:
+        """Mark an outbox event as completed or failed."""
+        status = "failed" if error else "completed"
+        with self._lock:
+            self._connection.execute(
+                "UPDATE outbox_events SET status = ?, error = ?, processed_at = ? WHERE id = ?",
+                (status, error, utc_now(), event_id)
+            )
+            self._commit_if_needed()
 
     def list_events(self, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         query = "SELECT * FROM events"

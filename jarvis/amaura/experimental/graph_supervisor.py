@@ -5,9 +5,9 @@ from langgraph.graph import StateGraph, END
 from jarvis.amaura.control_plane import AmauraControlPlane
 from jarvis.amaura.actions import AmauraActions
 from jarvis.amaura.models import TaskState
-from jarvis.amaura.graphs.lead import LeadWorkflowGraph
-from jarvis.amaura.graphs.software import SoftwareWorkflowGraph
-from jarvis.amaura.graphs.content import ContentWorkflowGraph
+from jarvis.amaura.experimental.graphs.lead import LeadWorkflowGraph
+from jarvis.amaura.experimental.graphs.software import SoftwareWorkflowGraph
+from jarvis.amaura.experimental.graphs.content import ContentWorkflowGraph
 
 class SupervisorState(TypedDict):
     worker_id: str
